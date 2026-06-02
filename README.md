@@ -134,6 +134,24 @@ Notes are intentionally local and are only included in reports when you explicit
 
 The Background Monitor is optional and user-scoped. It runs as a LaunchAgent in the user GUI domain and keeps continuous monitoring outside the main app process.
 
+### Recent Updates
+
+- Added an authorized-use acknowledgment dialog that appears once per GUI login session
+- Added a persistent bottom-right overlay for high and critical events
+- Added explicit hardware handling for USB recognition and moisture detection
+- Added a fast USB reconnect observer so brief disconnect/reconnect cycles are captured reliably
+- Added trusted USB inventory tracking so first-seen physical USB identities can escalate to a critical alert
+- Added system-daemon support so the monitor can also run from `/Library/LaunchDaemons` with shared runtime and log paths
+- Added a medium-severity alert when keyboard, mouse, and trackpad input resumes after 2 minutes of inactivity
+- That idle-resume event reuses the CFAA reminder dialog so the user sees the same authorized-use warning again after inactivity
+- Added separate sounds for USB recognition and moisture detection
+- Added informational bottom-right overlay alerts for new IP assignments and VPN connections
+- Added critical persistence alerts for new LaunchDaemons and other startup persistence methods
+- Added logging of previous and current startup persistence inventories
+- Added a Security Flight Recorder context window with `Show Context` for findings and monitor events
+- Added a CVE findings digest that includes the authorized-use reminder and deduplicates repeated digests
+- Added documentation for the hardware notice design and UAT coverage
+
 ### LaunchAgent Behavior
 
 - Installed under `~/Library/LaunchAgents/com.mac-audit-agent.monitor.plist`
@@ -141,6 +159,8 @@ The Background Monitor is optional and user-scoped. It runs as a LaunchAgent in 
 - Runs continuously with `RunAtLoad = true` and `KeepAlive = true`
 - Writes stdout and stderr logs under `~/.mac_audit_agent/logs`
 - Uses a runtime copy under `~/.mac_audit_agent/runtime` to avoid protected-folder access issues
+
+The monitor code now also supports a system LaunchDaemon mode. In that mode the plist lives under `/Library/LaunchDaemons`, the launch target is `system`, and the runtime, logs, and SQLite path move to shared locations under `/Library/Application Support/MacAuditAgent` and `/Library/Logs/MacAuditAgent`.
 
 ### Monitor Actions
 
@@ -166,8 +186,24 @@ The monitor records privacy and session indicators such as:
 - remote login and screen sharing posture
 - suspicious processes
 - persistence and high-risk security events
+- input activity resuming after extended inactivity
+- USB reconnects and first-seen USB devices
+- explicit moisture or liquid detection markers
 
 The monitor writes events to SQLite and to local logs, then applies notification policy rules. By default, severe events may alert while normal activity stays silent and still gets logged.
+
+The visible alert policy is intentionally narrower than storage. Informational events stay non-modal by default, while first-seen USB hardware is treated as critical and new network/VPN assignment events show as subtle informational overlays.
+
+### Investigator Workflow Layer
+
+The workflow layer sits above raw detectors and scan output:
+
+- Security Replay: compares saved scan moments and recent monitor events over time
+- Review Queue: ranks findings by severity, confidence, review state, and suppression history
+- Explainability Engine: summarizes what happened, why it matters, supporting evidence, and the next action
+- Security Flight Recorder: builds a 15-minute before/after context window for findings and monitor events and shows the surrounding timeline
+
+The workflow layer stays local-only and uses evidence already captured by the app. It does not make unsupported compromise claims.
 
 ### Monitor Health
 
@@ -260,6 +296,8 @@ pytest mac_audit_agent/tests/test_background_monitor.py
 
 - If the Background Monitor shows `ModuleNotFoundError`, reinstall it so the LaunchAgent runs from the runtime copy under `~/.mac_audit_agent/runtime`
 - If LaunchAgent bootstrap fails, check the monitor stdout and stderr logs under `~/.mac_audit_agent/logs`
+- Design notes for the new USB/CFAA behavior are in `docs/CFAA_HARDWARE_NOTICE_DESIGN.md`
+- UAT steps for the background monitor are in `docs/UAT_BACKGROUND_MONITOR.md`
 - If network discovery returns no devices, verify the selected interface and confirm the subnet is the one you intended to assess
 - If reports look empty, confirm a scan has completed and the current scan result is loaded
 

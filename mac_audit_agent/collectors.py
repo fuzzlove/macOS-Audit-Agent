@@ -35,6 +35,7 @@ from mac_audit_agent.analyzers import (
 )
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
+from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_finding
 from mac_audit_agent.models import (
     AuditCommand,
     BaselineComparison,
@@ -1614,12 +1615,15 @@ class CollectorSuite:
         privilege_context = self._privilege_escalation_context(category, title, description, why_this_matters)
         business_impact = self._business_impact_summary(category, severity, title, description, privilege_context)
         local_network_impact = self._local_network_impact_summary(category, severity, title, description)
+        rule = rule_for_finding(category, title, evidence=evidence_summary or evidence, command_used=command_used)
+        current_time = utc_now_iso()
         remediation_steps = [step.strip() for step in [recommended_next_steps, "Verify the affected service, file, or account before changing anything.", "Re-run the scan and compare against baseline after any change."] if step.strip()]
         remediation_commands = self._default_remediation_commands(command_used)
         remediation_risk = self._default_remediation_risk(category, recommended_next_steps)
         remediation_references = self._default_remediation_references(category, recommended_next_steps)
         reversible = remediation_risk != "dangerous"
         estimated_impact = "high" if severity in {"critical", "high"} else "medium" if severity == "medium" else "low"
+        provenance_text = evidence_summary or evidence
         return Finding(
             id=str(uuid4()),
             category=category,
@@ -1650,6 +1654,28 @@ class CollectorSuite:
             business_impact=business_impact,
             local_network_impact=local_network_impact,
             privilege_escalation_context=privilege_context,
+            rule_id=rule.rule_id,
+            rule_name=rule.name,
+            event_id=f"finding-{title.lower().replace(' ', '-')}-{current_time}",
+            event_type="scan_finding",
+            trigger_source="scan_collector",
+            trigger_subsource=category.lower().replace(" ", "_"),
+            trigger_rule_id=rule.rule_id,
+            trigger_rule_name=rule.name,
+            raw_signal_summary=provenance_text,
+            normalized_signal=normalized_signal(category, title, provenance_text, command_used),
+            evidence_hash=evidence_hash(category, title, provenance_text, command_used),
+            related_process=command_used if command_used and not command_used.startswith("/") else "",
+            related_path=command_used if command_used.startswith("/") else "",
+            first_seen=current_time,
+            last_seen=current_time,
+            previous_state="not flagged",
+            current_state="flagged by scan",
+            baseline_status="new observation",
+            correlation_id=correlation_id_for(category, title, provenance_text, command_used, timestamp=current_time),
+            false_positive_hints=list(rule.false_positive_hints),
+            recommended_verification_steps=list(rule.verification_steps) + [f"Validate whether the finding still appears in a follow-up scan: {title}"],
+            source_trace=f"Detector=scan_collector; Rule={rule.rule_id}; Category={category}; Evidence={provenance_text}",
         )
 
     def _now_epoch(self) -> float:

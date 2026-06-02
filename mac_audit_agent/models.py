@@ -47,11 +47,19 @@ MonitorEventType = Literal[
     "screen_recording_permission_present",
     "suspicious_capture_process",
     "persistence_item_created",
+    "persistence_item_created_high_risk",
+    "launchagent_added",
+    "launchdaemon_added",
     "localhost_hidden_port_detected",
     "new_admin_user_detected",
     "packet_capture_started",
     "packet_capture_completed",
+    "usb_device_connected",
+    "system_moisture_detected",
+    "network_ip_assigned",
+    "vpn_connected",
     "major_security_event",
+    "alert_storm_detected",
     "monitor_self_test",
     "monitor_test_event",
 ]
@@ -167,9 +175,57 @@ class Finding:
     business_impact: str = ""
     local_network_impact: str = ""
     privilege_escalation_context: str = ""
+    rule_id: str = ""
+    rule_name: str = ""
+    event_id: str = ""
+    event_type: str = ""
+    trigger_source: str = ""
+    trigger_subsource: str = ""
+    trigger_rule_id: str = ""
+    trigger_rule_name: str = ""
+    raw_signal_summary: str = ""
+    normalized_signal: str = ""
+    evidence_hash: str = ""
+    related_process: str = ""
+    related_pid: int | None = None
+    related_parent_pid: int | None = None
+    related_path: str = ""
+    related_user: str = ""
+    related_network_endpoint: str = ""
+    related_url: str = ""
+    related_dom_selector: str = ""
+    related_file_hash: str = ""
+    first_seen: str = ""
+    last_seen: str = ""
+    previous_state: str = ""
+    current_state: str = ""
+    baseline_status: str = ""
+    correlation_id: str = ""
+    suppression_reason: str = ""
+    false_positive_hints: list[str] = field(default_factory=list)
+    recommended_verification_steps: list[str] = field(default_factory=list)
+    source_trace: str = ""
     created_at: str = field(default_factory=utc_now_iso)
 
     def __post_init__(self) -> None:
+        try:
+            from mac_audit_agent.rules import rule_for_finding
+
+            if not self.rule_id and self.category and self.title:
+                rule = rule_for_finding(self.category, self.title, self.evidence, self.command_used)
+                if rule and rule.rule_id:
+                    self.rule_id = rule.rule_id
+                    self.rule_name = rule.name
+                    self.trigger_rule_id = rule.rule_id
+                    self.trigger_rule_name = rule.name
+                    if not self.trigger_source:
+                        self.trigger_source = rule.source_detector
+                    if not self.false_positive_hints:
+                        self.false_positive_hints = list(rule.false_positive_hints)
+                    if not self.recommended_verification_steps:
+                        self.recommended_verification_steps = list(rule.verification_steps)
+        except Exception:
+            pass
         if self.severity in {"high", "critical"} and not self.remediation_steps:
             fallback = self.recommended_next_steps or self.remediation_suggestion or "Review the finding carefully before making changes."
             self.remediation_steps = [fallback]
@@ -179,6 +235,8 @@ class Finding:
             self.business_impact = "Review the finding in the context of the affected user, service, and data."
         if not self.local_network_impact:
             self.local_network_impact = "Validate whether this finding can affect only the local host or also nearby systems and shared services."
+        if not self.recommended_verification_steps:
+            self.recommended_verification_steps = list(self.verification_steps)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -194,6 +252,8 @@ class Finding:
             data["remediation_steps"] = [data["recommended_next_steps"]]
         if not data["verification_steps"]:
             data["verification_steps"] = [f"Re-run the relevant audit steps and compare against baseline for: {data['title']}"]
+        if not data["recommended_verification_steps"]:
+            data["recommended_verification_steps"] = list(data["verification_steps"])
         data["recommendation"] = data["recommended_next_steps"]
         return data
 
@@ -620,6 +680,54 @@ class BackgroundMonitorEvent:
     cooldown_remaining_seconds: int = 0
     popup_allowed: bool = False
     metadata_json: str = "{}"
+    rule_id: str = ""
+    rule_name: str = ""
+    trigger_source: str = ""
+    trigger_subsource: str = ""
+    trigger_rule_id: str = ""
+    trigger_rule_name: str = ""
+    raw_signal_summary: str = ""
+    normalized_signal: str = ""
+    evidence_hash: str = ""
+    related_process: str = ""
+    related_pid: int | None = None
+    related_parent_pid: int | None = None
+    related_path: str = ""
+    related_user: str = ""
+    related_network_endpoint: str = ""
+    related_url: str = ""
+    related_dom_selector: str = ""
+    related_file_hash: str = ""
+    first_seen: str = ""
+    last_seen: str = ""
+    previous_state: str = ""
+    current_state: str = ""
+    baseline_status: str = ""
+    correlation_id: str = ""
+    suppression_reason: str = ""
+    false_positive_hints: list[str] = field(default_factory=list)
+    recommended_verification_steps: list[str] = field(default_factory=list)
+    source_trace: str = ""
+
+    def __post_init__(self) -> None:
+        try:
+            from mac_audit_agent.rules import rule_for_event
+
+            if not self.rule_id and self.event_type:
+                rule = rule_for_event(str(self.event_type))
+                if rule and rule.rule_id and rule.enabled_by_default:
+                    self.rule_id = rule.rule_id
+                    self.rule_name = rule.name
+                    self.trigger_rule_id = rule.rule_id
+                    self.trigger_rule_name = rule.name
+                    if not self.trigger_source:
+                        self.trigger_source = rule.source_detector
+                    if not self.false_positive_hints:
+                        self.false_positive_hints = list(rule.false_positive_hints)
+                    if not self.recommended_verification_steps:
+                        self.recommended_verification_steps = list(rule.verification_steps)
+        except Exception:
+            pass
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -647,8 +755,11 @@ class BackgroundMonitorStatus:
     detector_last_run_counts: str = ""
     detector_enabled_camera: bool = False
     detector_enabled_session: bool = False
+    detector_enabled_network: bool = False
+    detector_enabled_persistence: bool = False
     detector_enabled_sharing: bool = False
     detector_enabled_process: bool = False
+    detector_enabled_hardware: bool = False
     detector_last_zero_reason: str = ""
     status_text: str = ""
     current_snapshot: str = ""
@@ -685,6 +796,23 @@ class ReviewChecklistItem:
     linked_finding_id: str = ""
     updated_at: str = field(default_factory=utc_now_iso)
     notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class FindingSuppressionRule:
+    fingerprint: str
+    title: str
+    category: str
+    severity: Severity
+    review_state: ReviewState
+    rationale: str
+    active: bool = True
+    matched_count: int = 0
+    first_seen_at: str = field(default_factory=utc_now_iso)
+    last_seen_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

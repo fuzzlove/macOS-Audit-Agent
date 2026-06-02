@@ -336,9 +336,11 @@ def test_scan_result_exports_include_logs_and_history(tmp_path: Path) -> None:
     assert '"raw_logs"' in json_content
     assert '"security_score"' in json_content
     assert '"localhost_scan"' in json_content
+    assert '"execution_evidence"' in json_content
     assert "Raw Logs" in html_content
     assert "History Indicators" in html_content
     assert "Baseline Comparison" in html_content
+    assert "Execution Evidence" in html_content
     assert "Localhost Port Scan" in html_content
     assert "References:" in html_content
     assert 'class="report-logo"' in html_content
@@ -411,6 +413,85 @@ def test_reports_include_ports_and_processes(tmp_path: Path) -> None:
     assert ">72<" in html_content
     assert "Listening Ports" in html_content
     assert "127.0.0.1" in html_content
+
+
+def test_reports_include_alert_provenance(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    scan_result.findings[0].rule_id = "localhost_hidden_port_detected"
+    scan_result.findings[0].trigger_source = "network_detector"
+    scan_result.findings[0].trigger_subsource = "lsof_listener"
+    scan_result.findings[0].correlation_id = "corr-123"
+    scan_result.findings[0].previous_state = "closed"
+    scan_result.findings[0].current_state = "listening"
+    scan_result.findings[0].false_positive_hints = ["dev server"]
+    scan_result.findings[0].recommended_verification_steps = ["inspect process"]
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    json_content = json_path.read_text(encoding="utf-8")
+    html_content = html_path.read_text(encoding="utf-8")
+    assert '"rule_id": "localhost_hidden_port_detected"' in json_content
+    assert "Alert Provenance" in html_content
+    assert "corr-123" in html_content
+
+
+def test_reports_include_apple_security_forecast_section(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    scan_result.collected_artifacts["apple_security_forecast"] = {
+        "generated_at": "2026-06-01T00:00:00+00:00",
+        "level": "elevated",
+        "sources_used": ["NVD CVE API", "CISA KEV", "FIRST EPSS"],
+        "cve_count": 2,
+        "kev_count": 1,
+        "display_cards": [
+            {
+                "card_id": "card-1",
+                "title": "CVE-2026-0001",
+                "cves": ["CVE-2026-0001"],
+                "cve_ids": ["CVE-2026-0001"],
+                "source": "apple",
+                "forecast_level": "elevated",
+                "applicability_confidence": "high",
+                "kev": True,
+                "apple_related": True,
+                "recommended_action": "Open System Settings > General > Software Update.",
+                "status": "new",
+                "why_shown_to_you": "Git is installed and matches the affected range.",
+            }
+        ],
+        "cards": [
+            {
+                "card_id": "card-1",
+                "title": "CVE-2026-0001",
+                "forecast_level": "elevated",
+                "applicability_confidence": "high",
+                "kev": True,
+                "apple_related": True,
+                "source": "apple",
+                "cves": ["CVE-2026-0001"],
+                "recommended_action": "Open System Settings > General > Software Update.",
+                "status": "new",
+                "why_it_matters": "Git issue.",
+            }
+        ],
+    }
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    json_content = json_path.read_text(encoding="utf-8")
+    html_content = html_path.read_text(encoding="utf-8")
+    assert '"apple_security_forecast"' in json_content
+    assert "Apple Security Forecast" in html_content
+    assert "CVE-2026-0001" in html_content
+    assert "Sources Used" in html_content
+
+
+def test_reports_include_empty_apple_security_forecast_section(tmp_path: Path) -> None:
+    scan_result = make_scan_result()
+    json_path = export_scan_result_json(scan_result, tmp_path / "scan.json")
+    html_path = export_scan_result_html(scan_result, tmp_path / "scan.html")
+    json_content = json_path.read_text(encoding="utf-8")
+    html_content = html_path.read_text(encoding="utf-8")
+    assert '"apple_security_forecast_summary"' in json_content
+    assert "Apple Security Forecast: no applicable cards at report time." in html_content
 
 
 def test_packet_capture_metadata_included_but_contents_not_embedded(tmp_path: Path) -> None:

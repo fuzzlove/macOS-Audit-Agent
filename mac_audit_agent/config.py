@@ -48,7 +48,19 @@ class AuditConfig:
     cache_dir: Path = field(default_factory=lambda: Path.home() / ".mac_audit_agent" / "cache")
     log_retention_days: int = 30
     dry_run: bool = False
+    fresh_baseline_validation_mode: bool = False
+    uat_live_environment_mode: bool = False
+    disable_packet_capture: bool = False
+    disable_aggressive_scan: bool = False
+    allow_system_modifications: bool = False
+    auto_update_apple_security_forecast: bool = False
+    update_interval_hours: int = 6
+    show_review_needed_apple_cves: bool = False
     include_history_context: bool = False
+    recovery_snapshot_dir: Path = field(default_factory=lambda: Path.home() / "Library" / "Application Support" / "MacAuditAgent" / "snapshots")
+    cleanup_crash_log_age_days: int = 30
+    recovery_scan_timeout_seconds: int = 10
+    recovery_cleanup_exclusions: list[str] = field(default_factory=list)
     redact_usernames: bool = True
     redact_paths: bool = True
     redact_ips: bool = True

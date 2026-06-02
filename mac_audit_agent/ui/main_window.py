@@ -73,6 +73,14 @@ from mac_audit_agent.reporting import (
 )
 from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.storage import AuditDatabase, json_safe
+from mac_audit_agent.cve_radar import CveRadarEngine
+from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
+from mac_audit_agent.ui.context_dialog import ContextDialog
+from mac_audit_agent.ui.provenance_dialog import AlertProvenanceDialog
+from mac_audit_agent.ui.cve_radar_panel import CveRadarDetailsDialog, CveRadarPanel, make_forecast_button
+from mac_audit_agent.ui.system_recovery_panel import RecoveryEvidenceWarningDialog, SystemRecoveryPanel
+from mac_audit_agent.recovery_center import SystemRecoveryCenter
+from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
 from mac_audit_agent.vulnerability_review import AggressiveLocalVulnerabilityReviewer
 
@@ -530,12 +538,17 @@ class MainWindow(QMainWindow):
         self.runner = SafeCommandRunner(RunnerConfig(dry_run=self.config.dry_run))
         self.collectors = CollectorSuite(self.runner, self.config)
         self.db = AuditDatabase(db_path, self.config.logs_dir, self.config.log_retention_days)
+        self.cve_radar_engine = CveRadarEngine(self.db, self.config)
+        self.recovery_center = SystemRecoveryCenter(self.db, self.config)
+        self.workflow_layer = InvestigatorWorkflowLayer(self.db)
+        self.execution_evidence_engine = ExecutionEvidenceEngine()
         self.launch_agent_manager = LaunchAgentManager(db_path)
         self.vulnerability_reviewer = AggressiveLocalVulnerabilityReviewer(self.config)
         self.current_scan_summary: ScanSummary | None = None
         self.current_payload: dict | None = None
         self.current_visible_findings: list[dict] = []
         self.current_selected_finding: dict | None = None
+        self.execution_evidence_findings: list[dict] = []
         self._active_network_discovery_dialog: NetworkDiscoveryProgressDialog | None = None
         self.findings_sort_order = "critical_to_low"
         self.last_ui_debug: dict[str, object] = {}
@@ -555,6 +568,8 @@ class MainWindow(QMainWindow):
             self._load_scan_result(self.current_scan_result)
         else:
             self.summary_label.setText("No active scan. Run a scan to begin.")
+        self.refresh_apple_security_forecast(manual=False, initial_load=True)
+        self.refresh_system_recovery(manual=False, initial_load=True)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -564,18 +579,37 @@ class MainWindow(QMainWindow):
         outer.setSpacing(8)
 
         self.sidebar = QListWidget()
-        self.sidebar.addItems(["Dashboard", "Scan Categories", "Results", "Investigation Notes", "Background Monitor", "Command Preview"])
+        self.sidebar.addItems(["Dashboard", "Apple Security Forecast", "Scan Categories", "Results", "Investigation Notes", "Background Monitor", "Command Preview", "System Recovery"])
         self.sidebar.setMaximumWidth(180)
         self.sidebar.setMinimumWidth(140)
         self.sidebar.currentRowChanged.connect(self._change_page)
 
+        self.cve_radar_panel = CveRadarPanel(self)
+        self.cve_radar_panel.update_requested.connect(lambda: self.refresh_apple_security_forecast(manual=True))
+        self.cve_radar_panel.diagnostics_requested.connect(self.show_apple_security_forecast_diagnostics)
+        self.cve_radar_panel.demo_requested.connect(self.generate_demo_apple_security_forecast)
+        self.cve_radar_panel.clear_demo_requested.connect(self.clear_demo_apple_security_forecast)
+        self.cve_radar_panel.export_requested.connect(self.export_html)
+        self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
+        self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
+        self.cve_radar_panel.set_status("Forecast not checked yet")
+        self.system_recovery_panel = SystemRecoveryPanel(self)
+        self.system_recovery_panel.incident_check_requested.connect(self.run_system_recovery_incident_check)
+        self.system_recovery_panel.snapshot_requested.connect(self.create_system_recovery_snapshot)
+        self.system_recovery_panel.preview_requested.connect(self.preview_system_recovery_cleanup)
+        self.system_recovery_panel.cleanup_requested.connect(self.run_system_recovery_cleanup)
+        self.system_recovery_panel.open_snapshots_requested.connect(self.open_system_recovery_snapshots_folder)
+
         self.pages = QStackedWidget()
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True))
+        self.forecast_page_widget = self._build_forecast_page()
+        self.pages.addWidget(self._wrap_in_scroll_area(self.forecast_page_widget, resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_categories_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_results_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_notes_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_background_monitor_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_preview_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_system_recovery_page(), resizable=True))
         self.sidebar.setCurrentRow(0)
 
         self.details_panel = self._build_selected_command_panel()
@@ -588,6 +622,10 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.sidebar)
         outer.addWidget(self.main_splitter)
         self._update_responsive_layout()
+        self.cve_radar_timer = QTimer(self)
+        self.cve_radar_timer.setInterval(self.cve_radar_engine.update_interval_seconds * 1000)
+        self.cve_radar_timer.timeout.connect(self.refresh_apple_security_forecast)
+        self.cve_radar_timer.start()
 
     def _wrap_in_scroll_area(self, widget: QWidget, *, resizable: bool) -> QScrollArea:
         scroll = QScrollArea()
@@ -701,12 +739,49 @@ class MainWindow(QMainWindow):
         self._apply_logo_to_label(self.header_logo_label, 64, 64, name="logo.png", rounded=True, radius=14.0)
         self._apply_logo_to_label(self.dashboard_logo_label, 160, 160, name="logo2.png", rounded=True, radius=24.0)
 
+        self.dashboard_forecast_frame = QFrame()
+        self.dashboard_forecast_frame.setObjectName("dashboardForecastSummary")
+        self.dashboard_forecast_frame.setStyleSheet(
+            """
+            QFrame#dashboardForecastSummary {
+                background: rgba(24, 31, 46, 220);
+                border: 1px solid rgba(88, 166, 255, 120);
+                border-radius: 12px;
+            }
+            """
+        )
+        forecast_layout = QVBoxLayout(self.dashboard_forecast_frame)
+        forecast_layout.setContentsMargins(14, 14, 14, 14)
+        forecast_layout.setSpacing(6)
+        forecast_title = QLabel("Apple Security Forecast")
+        forecast_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #F0F6FC;")
+        self.dashboard_forecast_level_label = QLabel("Level: Forecast not checked yet")
+        self.dashboard_forecast_last_checked_label = QLabel("Last checked: not yet")
+        self.dashboard_forecast_cards_label = QLabel("Cards: 0")
+        self.dashboard_forecast_kev_label = QLabel("KEV: 0")
+        for label in [
+            self.dashboard_forecast_level_label,
+            self.dashboard_forecast_last_checked_label,
+            self.dashboard_forecast_cards_label,
+            self.dashboard_forecast_kev_label,
+        ]:
+            label.setStyleSheet("color: #D6E4FF;")
+        self.open_forecast_button = make_forecast_button("Open Forecast", "Open the dedicated Apple Security Forecast tab.", "primary")
+        self.open_forecast_button.clicked.connect(self.show_forecast_page)
+        forecast_layout.addWidget(forecast_title)
+        forecast_layout.addWidget(self.dashboard_forecast_level_label)
+        forecast_layout.addWidget(self.dashboard_forecast_last_checked_label)
+        forecast_layout.addWidget(self.dashboard_forecast_cards_label)
+        forecast_layout.addWidget(self.dashboard_forecast_kev_label)
+        forecast_layout.addWidget(self.open_forecast_button)
+
         privacy = QLabel(
             "Privacy warning: shell history review stores only matched indicators and counts by default. "
             "Snippets are redacted and context is disabled unless you change the configuration."
         )
         privacy.setWordWrap(True)
 
+        layout.addWidget(self.dashboard_forecast_frame)
         self.dashboard_cards = {}
         self.severity_cards = {}
         self.dashboard_card_widgets: list[QFrame] = []
@@ -851,6 +926,26 @@ class MainWindow(QMainWindow):
         network_layout.addWidget(QLabel("Suspicious / Review Needed Devices"))
         network_layout.addWidget(self.network_discovery_suspicious_table)
         self.network_discovery_hosts_table.itemSelectionChanged.connect(self._refresh_network_discovery_device_details)
+        self.workflow_page = QWidget()
+        workflow_layout = QVBoxLayout(self.workflow_page)
+        workflow_layout.setContentsMargins(8, 8, 8, 8)
+        workflow_layout.addWidget(QLabel("Workflow view: what changed, what to review, and what the evidence supports."))
+        self.workflow_replay_table = self._make_table(["Timestamp", "Type", "Title", "Summary"])
+        self.workflow_review_queue_table = self._make_table(["Priority", "Severity", "Confidence", "State", "Suppressed", "Title", "Next Action"])
+        self.workflow_explanation_table = self._make_table(["Field", "Value"])
+        self.workflow_review_queue_table.itemSelectionChanged.connect(self._refresh_workflow_explanation)
+        workflow_layout.addWidget(QLabel("Replay Timeline"))
+        workflow_layout.addWidget(self.workflow_replay_table)
+        workflow_layout.addWidget(QLabel("Review Queue"))
+        workflow_layout.addWidget(self.workflow_review_queue_table)
+        workflow_layout.addWidget(QLabel("Explainability"))
+        workflow_layout.addWidget(self.workflow_explanation_table)
+        self.execution_evidence_page = QWidget()
+        execution_layout = QVBoxLayout(self.execution_evidence_page)
+        execution_layout.setContentsMargins(8, 8, 8, 8)
+        execution_layout.addWidget(QLabel("Execution Evidence view: evidence only, no compromise claims."))
+        self.execution_evidence_table = self._make_table(["Confidence", "Evidence", "Timeline", "Explanation", "Recommended Actions"])
+        execution_layout.addWidget(self.execution_evidence_table)
         for name, widget in [
             ("Findings", findings_page),
             ("Ports", self.ports_table),
@@ -858,6 +953,8 @@ class MainWindow(QMainWindow):
             ("Full Localhost Port Scan", self.localhost_full_scan_table),
             ("Packet Capture Snapshot", self.packet_capture_table),
             ("Local Network Device Discovery", self.network_discovery_page),
+            ("Workflow Layer", self.workflow_page),
+            ("Execution Evidence", self.execution_evidence_page),
             ("Catalog Update Status", self.catalog_status_table),
             ("CVE Findings", cve_findings_page),
             ("Best Practice Findings", self.best_practice_findings_table),
@@ -871,6 +968,20 @@ class MainWindow(QMainWindow):
         ]:
             self.results_tabs.addTab(widget, name)
         layout.addWidget(self.results_tabs)
+        return page
+
+    def _build_forecast_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.cve_radar_panel)
+        return page
+
+    def _build_system_recovery_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.system_recovery_panel)
         return page
 
     def _build_preview_page(self) -> QWidget:
@@ -977,6 +1088,10 @@ class MainWindow(QMainWindow):
         self.mark_confirmed_button.clicked.connect(lambda: self._set_selected_finding_review_state("confirmed concern"))
         self.mark_follow_up_button = QPushButton("Mark Needs Follow-Up")
         self.mark_follow_up_button.clicked.connect(lambda: self._set_selected_finding_review_state("needs follow-up"))
+        self.show_context_button = QPushButton("Show Context")
+        self.show_context_button.clicked.connect(self.show_selected_finding_context)
+        self.show_provenance_button = QPushButton("Why did this alert fire?")
+        self.show_provenance_button.clicked.connect(self.show_selected_finding_provenance)
         for index, widget in enumerate(
             [
                 self.add_finding_note_button,
@@ -984,6 +1099,8 @@ class MainWindow(QMainWindow):
                 self.mark_false_positive_button,
                 self.mark_confirmed_button,
                 self.mark_follow_up_button,
+                self.show_context_button,
+                self.show_provenance_button,
             ]
         ):
             review_actions.addWidget(widget, index // 2, index % 2)
@@ -1321,7 +1438,7 @@ class MainWindow(QMainWindow):
             linked_scan_id=scan_id,
         )
         self.db.save_investigation_note(note)
-        self.sidebar.setCurrentRow(3)
+        self.sidebar.setCurrentRow(4)
         self.refresh_investigation_notes_page()
 
     def _set_selected_finding_review_state(self, state: str) -> None:
@@ -1338,6 +1455,69 @@ class MainWindow(QMainWindow):
             linked_finding_id=finding_id,
         )
         self.refresh_investigation_notes_page()
+
+    def show_selected_finding_context(self) -> None:
+        if not self.current_selected_finding:
+            QMessageBox.information(self, "No Finding", "Select a finding first.")
+            return
+        scan = self.current_scan_result
+        anchor_timestamp = scan.timestamp if scan is not None else str(self.current_selected_finding.get("created_at", "") or utc_now_iso())
+        window = self.workflow_layer.build_context_window(
+            anchor_timestamp,
+            focus_label=str(self.current_selected_finding.get("title", "Selected finding")),
+            focus_kind="finding",
+            focus_category=str(self.current_selected_finding.get("category", "finding")),
+            focus_id=str(self.current_selected_finding.get("id", "")),
+            focus_scan_id=scan.scan_id if scan is not None else "",
+        )
+        ContextDialog(window, self).exec()
+
+    def _selected_finding_provenance_text(self, finding: dict) -> str:
+        hints = finding.get("false_positive_hints", []) or []
+        steps = finding.get("recommended_verification_steps", []) or finding.get("verification_steps", []) or []
+        lines = [
+            f"Alert: {finding.get('title', '')}",
+            f"Rule: {finding.get('rule_id') or finding.get('trigger_rule_id', '')} ({finding.get('rule_name') or finding.get('trigger_rule_name', '')})",
+            f"Detector: {finding.get('trigger_source', '')} / {finding.get('trigger_subsource', '')}",
+            f"Confidence: {finding.get('confidence', finding.get('severity', 'info'))}",
+            f"Evidence: {finding.get('evidence_summary', finding.get('evidence', ''))}",
+            f"Previous state: {finding.get('previous_state', '')}",
+            f"Current state: {finding.get('current_state', '')}",
+            f"First seen: {finding.get('first_seen', finding.get('created_at', ''))}",
+            f"Last seen: {finding.get('last_seen', finding.get('created_at', ''))}",
+            f"Correlation: {finding.get('correlation_id', '')}",
+            f"Baseline: {finding.get('baseline_status', '')}",
+            f"Possible false-positive reason: {', '.join(str(item) for item in hints) if hints else finding.get('false_positive_notes', '')}",
+            f"Verification: {', '.join(str(item) for item in steps) if steps else finding.get('recommended_next_steps', '')}",
+        ]
+        if finding.get("raw_signal_summary"):
+            lines.append(f"Raw signal: {finding.get('raw_signal_summary')}")
+        if finding.get("normalized_signal"):
+            lines.append(f"Normalized signal: {finding.get('normalized_signal')}")
+        if finding.get("source_trace"):
+            lines.append(f"Source trace: {finding.get('source_trace')}")
+        if finding.get("evidence_hash"):
+            lines.append(f"Evidence hash: {finding.get('evidence_hash')}")
+        if finding.get("source_trace"):
+            lines.append(f"Source trace: {finding.get('source_trace')}")
+        return "\n".join(line for line in lines if line)
+
+    def show_selected_finding_provenance(self) -> None:
+        if not self.current_selected_finding:
+            QMessageBox.information(self, "No Finding", "Select a finding first.")
+            return
+        scan = self.current_scan_result
+        anchor_timestamp = scan.timestamp if scan is not None else str(self.current_selected_finding.get("created_at", "") or utc_now_iso())
+        window = self.workflow_layer.build_context_window(
+            anchor_timestamp,
+            focus_label=str(self.current_selected_finding.get("title", "Selected finding")),
+            focus_kind="finding",
+            focus_category=str(self.current_selected_finding.get("category", "finding")),
+            focus_id=str(self.current_selected_finding.get("id", "")),
+            focus_scan_id=scan.scan_id if scan is not None else "",
+        ).to_dict()
+        body = self._selected_finding_provenance_text(self.current_selected_finding)
+        AlertProvenanceDialog("Alert Provenance", body, window, self).exec()
 
     def export_investigation_notes_json_file(self) -> None:
         scan_id = self._current_scan_id()
@@ -1439,7 +1619,7 @@ class MainWindow(QMainWindow):
                 details = self._render_command_details(command)
                 self.command_preview.setPlainText(details)
                 self.selected_command_panel.setPlainText(details)
-                self.sidebar.setCurrentRow(3)
+                self.sidebar.setCurrentRow(6)
                 break
         else:
             self._refresh_command_preview_page()
@@ -1497,6 +1677,8 @@ class MainWindow(QMainWindow):
             "mark_false_positive_button",
             "mark_confirmed_button",
             "mark_follow_up_button",
+            "show_context_button",
+            "show_provenance_button",
         ]:
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1544,6 +1726,8 @@ class MainWindow(QMainWindow):
             "mark_false_positive_button",
             "mark_confirmed_button",
             "mark_follow_up_button",
+            "show_context_button",
+            "show_provenance_button",
         ]:
             widget = getattr(self, name, None)
             if widget is not None:
@@ -1796,6 +1980,7 @@ class MainWindow(QMainWindow):
         for severity, value in severity_counts.items():
             self.severity_cards[severity].setText(str(value))
         self._populate_findings(normalized_findings if not self.current_payload else normalize_findings(self.current_payload.get("findings", [])))
+        self._refresh_workflow_layer()
 
     def _load_scan_result(self, scan_result: ScanResult) -> None:
         self.current_scan_result = scan_result
@@ -1836,15 +2021,392 @@ class MainWindow(QMainWindow):
             },
         }
         self._populate_scan_results(self.current_payload)
+        self._refresh_workflow_layer()
         self.refresh_investigation_notes_page()
+        self.refresh_cve_radar(manual=False)
+        self.refresh_system_recovery(manual=False)
+
+    def _refresh_workflow_layer(self) -> None:
+        if not hasattr(self, "workflow_replay_table"):
+            return
+        replay = self.workflow_layer.build_security_replay(limit=12, focus_scan_id=self.current_scan_result.scan_id if self.current_scan_result else None)
+        queue = self.workflow_layer.build_review_queue(scan_id=self.current_scan_result.scan_id if self.current_scan_result else None)
+        self._populate_table(
+            self.workflow_replay_table,
+            [[moment.timestamp, moment.moment_type, moment.title, moment.summary] for moment in replay],
+        )
+        self._populate_table(
+            self.workflow_review_queue_table,
+            [
+                [
+                    str(item.priority_score),
+                    item.severity,
+                    item.confidence,
+                    item.review_state,
+                    "yes" if item.suppressed else "no",
+                    item.title,
+                    item.explanation.get("next_action", ""),
+                ]
+                for item in queue
+            ],
+        )
+        if self.workflow_review_queue_table.rowCount() > 0:
+            self.workflow_review_queue_table.selectRow(0)
+        self._refresh_workflow_explanation()
+
+    def _refresh_workflow_explanation(self) -> None:
+        if not hasattr(self, "workflow_explanation_table"):
+            return
+        if self.current_scan_result is None:
+            self._populate_table(self.workflow_explanation_table, [["No scan selected", "Run or open a scan first."]])
+            return
+        queue = self.workflow_layer.build_review_queue(scan_id=self.current_scan_result.scan_id)
+        row = self.workflow_review_queue_table.currentRow() if hasattr(self, "workflow_review_queue_table") else -1
+        if row < 0 or row >= len(queue):
+            if queue:
+                row = 0
+            else:
+                self._populate_table(self.workflow_explanation_table, [["No review items", "No findings need workflow review yet."]])
+                return
+        item = queue[row]
+        rows = [[key.replace("_", " ").title(), value] for key, value in item.explanation.items()]
+        rows.insert(0, ["Priority Score", str(item.priority_score)])
+        rows.insert(1, ["Severity", item.severity])
+        rows.insert(2, ["Confidence", item.confidence])
+        rows.insert(3, ["Review State", item.review_state])
+        rows.insert(4, ["Suppressed", "yes" if item.suppressed else "no"])
+        self._populate_table(self.workflow_explanation_table, rows)
+
+    def _apply_cve_radar_payload(self, radar_payload: dict[str, object]) -> None:
+        if self.current_payload is None:
+            self.current_payload = {
+                "findings": [],
+                "ports": {"listening": [], "active_connections": [], "suspicious_review_needed": [], "errors": []},
+                "localhost_scan": {"target": "127.0.0.1", "mode": "safe", "protocol": "tcp", "open_ports": [], "missing_from_enumeration": [], "errors": [], "scanned_port_count": 0},
+                "localhost_full_port_scan": {"target": "127.0.0.1", "tcp_open_ports": [], "tcp_banners": {}, "udp_responsive_or_unknown_ports": [], "scanned_tcp_count": 0, "scanned_udp_count": 0, "errors": []},
+                "packet_captures": [],
+                "network_discovery": {"interface": "", "subnet": "", "gateway": "", "gateway_ip": "", "gateway_mac": "", "scope": "", "host_count": 0, "review_needed_count": 0, "hosts": [], "devices": [], "comparison": {}, "debug_logs": [], "errors": []},
+                "processes": {"all": [], "suspicious": [], "errors": []},
+                "users": [],
+                "history_indicators": [],
+                "permission_snapshots": [],
+                "file_issues": [],
+                "raw_logs": [],
+                "baseline_diff": {},
+                "dashboard": {
+                    "suspicious_ports": 0,
+                    "users_admin_changes": 0,
+                    "history_indicators": 0,
+                    "suspicious_directories": 0,
+                    "new_since_last_scan": 0,
+                },
+            }
+        self.current_payload["apple_security_forecast"] = radar_payload
+        self.current_payload["cve_radar"] = radar_payload
+        if self.current_scan_result is not None:
+            self.current_scan_result.collected_artifacts["apple_security_forecast"] = radar_payload
+            self.current_scan_result.collected_artifacts["cve_radar"] = radar_payload
+        if hasattr(self, "cve_radar_panel"):
+            self.cve_radar_panel.set_radar_data(radar_payload)
+            state_text = str(radar_payload.get("state_text", "") or radar_payload.get("level", radar_payload.get("forecast_level", "Forecast not checked yet")))
+            self.cve_radar_panel.set_status(state_text)
+        if hasattr(self, "dashboard_forecast_level_label"):
+            level_text = str(radar_payload.get("state_text", radar_payload.get("level", "Forecast not checked yet")))
+            self.dashboard_forecast_level_label.setText(f"Level: {level_text}")
+            self.dashboard_forecast_last_checked_label.setText(f"Last checked: {radar_payload.get('generated_at', radar_payload.get('timestamp', 'not yet'))}")
+            self.dashboard_forecast_cards_label.setText(f"Cards: {radar_payload.get('card_count', len(radar_payload.get('display_cards', radar_payload.get('cards', []))))}")
+            self.dashboard_forecast_kev_label.setText(f"KEV: {radar_payload.get('kev_count', radar_payload.get('kev_matches', 0))}")
+        LOGGER.info(
+            "Apple Security Forecast rendered card_count=%d state=%s",
+            len(radar_payload.get("display_cards", radar_payload.get("cards", []))),
+            radar_payload.get("state_text", radar_payload.get("level", "")),
+        )
+
+    def refresh_apple_security_forecast(
+        self,
+        manual: bool = False,
+        force: bool = False,
+        *,
+        initial_load: bool = False,
+        demo: bool = False,
+    ) -> None:
+        if not hasattr(self, "cve_radar_panel"):
+            return
+        if initial_load and not manual and not force and not demo and not self.config.auto_update_apple_security_forecast:
+            LOGGER.info("Apple Security Forecast initial load from cache only")
+            cached = self.cve_radar_engine.load_cached_state()
+            self._apply_cve_radar_payload(cached)
+            self.statusBar().showMessage("Apple Security Forecast loaded from cache", 3000)
+            return
+        if not manual and not force and not demo and not self.config.auto_update_apple_security_forecast:
+            cached = self.cve_radar_engine.load_cached_state()
+            self._apply_cve_radar_payload(cached)
+            self.cve_radar_panel.set_status(str(cached.get("state_text", "Forecast not checked yet")))
+            return
+        self.cve_radar_panel.set_status("Checking Apple Security Forecast...")
+        try:
+            radar_payload = self.cve_radar_engine.update_radar(
+                current_scan_result=self.current_scan_result,
+                manual=manual,
+                force=force,
+                demo=demo,
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh Apple Security Forecast: %s", exc)
+            self.statusBar().showMessage("Apple Security Forecast update failed", 5000)
+            cached = self.cve_radar_engine.load_cached_state()
+            if not cached.get("timestamp") and not cached.get("display_cards"):
+                cached["state_text"] = "Unable to update forecast — no cache available"
+                cached["why_no_cards"] = str(exc)
+            else:
+                cached["state_text"] = "Unable to update forecast — using cache"
+                cached["why_no_cards"] = str(exc)
+            self._apply_cve_radar_payload(cached)
+            self.cve_radar_panel.set_status(str(cached.get("state_text", "Unable to update forecast — using cache")))
+            return
+        self._apply_cve_radar_payload(radar_payload)
+        LOGGER.info(
+            "Apple Security Forecast rendered state=%s cards=%d",
+            radar_payload.get("state_text", radar_payload.get("level", "")),
+            len(radar_payload.get("display_cards", radar_payload.get("cards", []))),
+        )
+        self.statusBar().showMessage("Apple Security Forecast updated", 3000)
+
+    def refresh_cve_radar(self, manual: bool = False, force: bool = False) -> None:
+        self.refresh_apple_security_forecast(manual=manual, force=force)
+
+    def _recovery_extra_specs(self) -> list[dict[str, object]]:
+        specs: list[dict[str, object]] = []
+        if not hasattr(self, "system_recovery_panel"):
+            return specs
+        for raw_path in self.system_recovery_panel.extra_cleanup_roots():
+            try:
+                path = Path(raw_path).expanduser()
+            except Exception:
+                continue
+            if not str(path).strip():
+                continue
+            specs.append(
+                {
+                    "category": "review",
+                    "kind": "user-selected log folder",
+                    "path": path,
+                    "risk": "medium",
+                }
+            )
+        return specs
+
+    def refresh_system_recovery(self, manual: bool = False, *, initial_load: bool = False, preview_only: bool = False) -> None:
+        if not hasattr(self, "system_recovery_panel"):
+            return
+        try:
+            context = self.recovery_center.build_context(self.current_scan_result, self.current_payload)
+            if preview_only or manual or initial_load:
+                preview = self.recovery_center.build_cleanup_preview(
+                    self.current_scan_result,
+                    self.current_payload,
+                    extra_roots=self._recovery_extra_specs() or None,
+                )
+                context["preview"] = preview.to_dict()
+                context["assessment"] = self.recovery_center.incident_awareness_check(self.current_scan_result, self.current_payload).to_dict()
+                context["snapshot_history"] = self.db.list_system_recovery_snapshots(limit=20)
+                context["cleanup_history"] = self.db.list_system_cleanup_actions(limit=20)
+                context["generated_at"] = preview.generated_at
+            self.system_recovery_panel.set_recovery_data(context)
+            LOGGER.info(
+                "System Recovery rendered state=%s score=%s opportunities=%s",
+                context.get("assessment", {}).get("title", ""),
+                context.get("preview", {}).get("recovery_score", 0),
+                context.get("preview", {}).get("opportunities", 0),
+            )
+        except Exception as exc:
+            LOGGER.exception("Failed to refresh System Recovery: %s", exc)
+            degraded = {
+                "assessment": {
+                    "title": "Unable to update recovery center",
+                    "level": "safe",
+                    "reasons": [str(exc)],
+                    "recommendation": "Review logs and try again.",
+                },
+                "preview": {
+                    "generated_at": "",
+                    "summary": "No recovery preview available.",
+                    "recovery_score": 0,
+                    "opportunities": 0,
+                    "total_recoverable_bytes": 0,
+                    "performance_improvement": "Low",
+                    "risk_level": "safe",
+                    "candidates": [],
+                    "growth_summary": [],
+                    "protected_paths": [],
+                },
+                "snapshot_history": self.db.list_system_recovery_snapshots(limit=20),
+                "cleanup_history": self.db.list_system_cleanup_actions(limit=20),
+                "cache_age": "unknown",
+                "generated_at": "",
+                "last_error": str(exc),
+            }
+            self.system_recovery_panel.set_recovery_data(degraded)
+
+    def run_system_recovery_incident_check(self) -> None:
+        self.refresh_system_recovery(manual=True)
+        assessment = self.recovery_center.incident_awareness_check(self.current_scan_result, self.current_payload)
+        QMessageBox.information(self, "Incident Awareness Check", f"{assessment.title}\n\n" + "\n".join(f"- {reason}" for reason in assessment.reasons))
+
+    def create_system_recovery_snapshot(self) -> None:
+        try:
+            assessment = self.recovery_center.incident_awareness_check(self.current_scan_result, self.current_payload)
+            preview = self.recovery_center.build_cleanup_preview(
+                self.current_scan_result,
+                self.current_payload,
+                extra_roots=self._recovery_extra_specs() or None,
+            )
+            snapshot = self.recovery_center.create_evidence_snapshot(self.current_scan_result, self.current_payload, assessment, preview, reason="manual")
+            self.statusBar().showMessage("System recovery snapshot created", 5000)
+            QMessageBox.information(self, "Evidence Snapshot Created", f"Snapshot created before cleanup:\n{snapshot['snapshot_path']}")
+        except Exception as exc:
+            LOGGER.exception("Failed to create system recovery snapshot: %s", exc)
+            QMessageBox.warning(self, "Snapshot Failed", f"Unable to create an evidence snapshot:\n{exc}")
+        finally:
+            self.refresh_system_recovery(manual=True)
+
+    def preview_system_recovery_cleanup(self) -> None:
+        self.refresh_system_recovery(manual=True, preview_only=True)
+        if hasattr(self, "system_recovery_panel"):
+            self.system_recovery_panel.tabs.setCurrentIndex(1)
+        self.statusBar().showMessage("System recovery preview updated", 3000)
+
+    def run_system_recovery_cleanup(self) -> None:
+        if not hasattr(self, "system_recovery_panel"):
+            return
+        warning_dialog = RecoveryEvidenceWarningDialog(self)
+        result = warning_dialog.exec()
+        choice = warning_dialog.choice() if result == QDialog.Accepted else "cancel"
+        if choice == "cancel":
+            self.statusBar().showMessage("System recovery cleanup cancelled", 3000)
+            return
+        assessment = self.recovery_center.incident_awareness_check(self.current_scan_result, self.current_payload)
+        preview = self.recovery_center.build_cleanup_preview(
+            self.current_scan_result,
+            self.current_payload,
+            extra_roots=self._recovery_extra_specs() or None,
+        )
+        if choice == "snapshot":
+            self.recovery_center.create_evidence_snapshot(self.current_scan_result, self.current_payload, assessment, preview, reason="cleanup")
+            self.statusBar().showMessage("Evidence snapshot created before cleanup", 4000)
+            self.refresh_system_recovery(manual=True)
+            return
+        selected_paths = self.system_recovery_panel.selected_cleanup_paths()
+        if not selected_paths:
+            QMessageBox.information(self, "No Cleanup Selection", "Select one or more cleanup candidates in the Cleanup tab before running cleanup.")
+            return
+        try:
+            result_payload = self.recovery_center.run_cleanup(
+                selected_paths,
+                self.current_scan_result,
+                self.current_payload,
+                create_snapshot_first=False,
+                preview=preview,
+                assessment=assessment,
+            )
+            deleted_count = len(result_payload.get("deleted", []))
+            self.statusBar().showMessage(f"System recovery cleanup completed: {deleted_count} items", 5000)
+            QMessageBox.information(self, "Cleanup Complete", str(result_payload.get("result_text", "Cleanup complete.")))
+        except Exception as exc:
+            LOGGER.exception("System recovery cleanup failed: %s", exc)
+            QMessageBox.warning(self, "Cleanup Failed", f"Cleanup could not be completed safely:\n{exc}")
+        finally:
+            self.refresh_system_recovery(manual=True)
+
+    def open_system_recovery_snapshots_folder(self) -> None:
+        snapshot_dir = Path(getattr(self.config, "recovery_snapshot_dir", Path.home() / "Library" / "Application Support" / "MacAuditAgent" / "snapshots")).expanduser()
+        try:
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["open", str(snapshot_dir)], check=False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Open Snapshots Folder Failed", f"Failed to open snapshots folder:\n{snapshot_dir}\n\n{exc}")
+            return
+        QMessageBox.information(self, "Open Snapshots Folder", f"Snapshots folder opened:\n{snapshot_dir}")
+
+    def show_apple_security_forecast_diagnostics(self) -> None:
+        diagnostics = self.cve_radar_engine.diagnostics_snapshot()
+        lines = [
+            f"Last update time: {diagnostics.get('last_update_time', 'not yet')}",
+            f"Last successful update time: {diagnostics.get('last_successful_update_time', 'not yet')}",
+            f"Cache age: {diagnostics.get('cache_age', 'unknown')}",
+            f"Apple source status: {diagnostics.get('apple_source_status', 'cache')}",
+            f"KEV source status: {diagnostics.get('kev_source_status', 'cache')}",
+            f"EPSS source status: {diagnostics.get('epss_source_status', 'cache')}",
+            f"macOS version/build: {diagnostics.get('inventory', {}).get('macos_version', '')} {diagnostics.get('inventory', {}).get('macos_build', '')}".strip(),
+            f"Safari version: {diagnostics.get('inventory', {}).get('safari_version', '')}",
+            f"WebKit version: {diagnostics.get('inventory', {}).get('webkit_version', '')}",
+            f"Xcode version: {diagnostics.get('inventory', {}).get('xcode_version', '')}",
+            f"CLT version: {diagnostics.get('inventory', {}).get('command_line_tools_version', '')}",
+            f"Architecture: {diagnostics.get('inventory', {}).get('architecture', '')}",
+            f"Model identifier: {diagnostics.get('inventory', {}).get('device_model', '')}",
+            f"Cards generated: {diagnostics.get('cards_generated_count', 0)}",
+            f"Filtered non-Apple CVEs: {diagnostics.get('filtered_non_apple_cves_count', 0)}",
+            f"Hidden review-needed: {diagnostics.get('hidden_review_needed_count', 0)}",
+            f"Last error: {diagnostics.get('last_error', 'none') or 'none'}",
+            "SQLite table counts:",
+            f"  apple_security_forecasts: {diagnostics.get('table_counts', {}).get('apple_security_forecasts', 0)}",
+            f"  apple_security_forecast_cards: {diagnostics.get('table_counts', {}).get('apple_security_forecast_cards', 0)}",
+            f"  apple_security_cve_cache: {diagnostics.get('table_counts', {}).get('apple_security_cve_cache', 0)}",
+            f"  apple_security_review_state: {diagnostics.get('table_counts', {}).get('apple_security_review_state', 0)}",
+        ]
+        dialog = CveRadarDetailsDialog("Forecast Diagnostics", "\n".join(lines), self)
+        dialog.exec()
+
+    def generate_demo_apple_security_forecast(self) -> None:
+        LOGGER.info("Generating demo Apple Security Forecast")
+        self.refresh_apple_security_forecast(manual=True, force=True, demo=True)
+
+    def clear_demo_apple_security_forecast(self) -> None:
+        LOGGER.info("Clearing demo Apple Security Forecast rows")
+        self.cve_radar_engine.clear_demo_forecast()
+        cached = self.cve_radar_engine.load_cached_state()
+        self._apply_cve_radar_payload(cached)
+
+    def _review_cve_radar_card(self, card: dict[str, object]) -> None:
+        alert_ids = [str(item.get("alert_id", "")) for item in card.get("alerts", [card]) if isinstance(item, dict) and item.get("alert_id")]
+        if not alert_ids:
+            return
+        for alert_id in alert_ids:
+            self.cve_radar_engine.mark_reviewed(alert_id, notes="Marked reviewed from radar panel.")
+        self._apply_cve_radar_payload(self.cve_radar_engine.load_cached_state())
+        self.statusBar().showMessage("Apple Security Forecast item marked reviewed", 3000)
+
+    def _snooze_cve_radar_card(self, card: dict[str, object], values: dict[str, object]) -> None:
+        alert_ids = [str(item.get("alert_id", "")) for item in card.get("alerts", [card]) if isinstance(item, dict) and item.get("alert_id")]
+        if not alert_ids:
+            return
+        days = values.get("days")
+        until_next_version_change = bool(values.get("until_next_version_change"))
+        for alert_id in alert_ids:
+            self.cve_radar_engine.snooze(
+                alert_id,
+                days=int(days) if isinstance(days, int) else None,
+                until_next_version_change=until_next_version_change,
+                notes="Snoozed from radar panel.",
+            )
+        self._apply_cve_radar_payload(self.cve_radar_engine.load_cached_state())
+        self.statusBar().showMessage("Apple Security Forecast item snoozed", 3000)
 
     def _change_page(self, row: int) -> None:
         if row >= 0 and hasattr(self, "pages"):
             self.pages.setCurrentIndex(row)
 
+    def show_forecast_page(self) -> None:
+        if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(1)
+
     def show_background_monitor_page(self) -> None:
         if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(3)
+            self.sidebar.setCurrentRow(5)
+
+    def show_system_recovery_page(self) -> None:
+        if hasattr(self, "sidebar"):
+            self.sidebar.setCurrentRow(7)
 
     def trigger_background_monitor_test_event(self) -> None:
         self.show_background_monitor_page()
@@ -1865,6 +2427,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("scan started")
         scan_mode = self.scan_mode_combo.currentData()
         localhost_protocol = self.localhost_protocol_combo.currentData()
+        if self.config.fresh_baseline_validation_mode or self.config.uat_live_environment_mode:
+            scan_mode = "safe"
+            localhost_protocol = "tcp"
         response = QMessageBox.question(
             self,
             "Shell History Privacy Warning",
@@ -1946,6 +2511,9 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Scan Complete", f"Scan finished with {len(scan_result.findings)} findings.")
 
     def run_aggressive_local_vulnerability_review(self) -> None:
+        if self.config.fresh_baseline_validation_mode or self.config.uat_live_environment_mode or self.config.disable_aggressive_scan:
+            QMessageBox.information(self, "Disabled", "Aggressive local vulnerability review is disabled in the current mode.")
+            return
         warning = (
             "This performs a local-only vulnerability and best-practice review using cached or freshly updated catalogs, "
             "local software inventory, and localhost artifacts. It does not exploit targets or scan remote hosts."
@@ -1992,12 +2560,16 @@ class MainWindow(QMainWindow):
         self.current_payload["review_needed_findings"] = review["review_needed_findings"]
         self.current_payload["vulnerability_review_stats"] = review["stats"]
         self.current_payload["patch_posture"] = review.get("patch_posture", {})
+        self.background_monitor_panel.notifications.notify_findings_digest(review["cve_findings"])
         self._populate_scan_results(self.current_payload)
         self.results_tabs.setCurrentWidget(self.catalog_status_table)
         self._refresh_command_preview_page()
         self.statusBar().showMessage("aggressive local vulnerability review completed", 5000)
 
     def run_full_localhost_port_scan(self) -> None:
+        if self.config.fresh_baseline_validation_mode or self.config.uat_live_environment_mode or self.config.disable_aggressive_scan:
+            QMessageBox.information(self, "Disabled", "Full localhost port scan is disabled in the current mode.")
+            return
         warning = (
             "This scans TCP and UDP ports 1-65535 on 127.0.0.1 only and performs passive TCP banner grabbing. "
             "It may take time, trigger local security tools, or create noisy logs. "
@@ -2171,6 +2743,9 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def run_packet_capture_snapshot(self) -> None:
+        if self.config.fresh_baseline_validation_mode or self.config.uat_live_environment_mode or self.config.disable_packet_capture:
+            QMessageBox.information(self, "Disabled", "Packet capture is disabled in the current mode.")
+            return
         if not tcpdump_available():
             QMessageBox.warning(self, "tcpdump Not Available", "tcpdump was not found at /usr/sbin/tcpdump.")
             return
@@ -2463,6 +3038,7 @@ class MainWindow(QMainWindow):
             [[str(item.get("severity", "")), str(item.get("title", "")), str(item.get("evidence", ""))] for item in suspicious_network_findings],
         )
         self._populate_vulnerability_results(payload)
+        self._populate_execution_evidence(payload)
         processes = payload.get("processes", {"all": [], "errors": []})
         process_rows = [[item.user, str(item.pid) if item.pid is not None else "", str(item.ppid) if item.ppid is not None else "", item.command_path, item.trust_level, str(item.trust_score), ",".join(item.reasons)] for item in processes.get("all", [])]
         if not process_rows:
@@ -2566,6 +3142,7 @@ class MainWindow(QMainWindow):
         self.current_visible_findings = []
         self.current_scan_active = False
         self.last_ui_debug = {}
+        self.execution_evidence_findings = []
         self._populate_findings([])
         self._clear_selected_finding_panel()
         for table_name in [
@@ -2579,6 +3156,7 @@ class MainWindow(QMainWindow):
             "network_discovery_debug_table",
             "network_discovery_changes_table",
             "network_discovery_suspicious_table",
+            "execution_evidence_table",
             "catalog_status_table",
             "cve_findings_table",
             "best_practice_findings_table",
@@ -2611,6 +3189,7 @@ class MainWindow(QMainWindow):
             self.investigation_checklist_table.setRowCount(0)
         self._refresh_command_preview_page()
         self.statusBar().showMessage("scan state cleared", 5000)
+        self.refresh_system_recovery(manual=False)
 
     def _populate_vulnerability_results(self, payload: dict) -> None:
         catalog_status = payload.get("catalog_status", {})
@@ -2679,6 +3258,35 @@ class MainWindow(QMainWindow):
                 for finding in review_needed_findings
             ],
         )
+
+    def _populate_execution_evidence(self, payload: dict) -> None:
+        if not hasattr(self, "execution_evidence_engine") or not hasattr(self, "execution_evidence_table"):
+            return
+        scan_result = self.current_scan_result
+        if scan_result is None:
+            self.execution_evidence_findings = []
+            self._populate_table(self.execution_evidence_table, [["No scan loaded", "", "", "", ""]])
+            return
+        findings = [item.to_dict() for item in self.execution_evidence_engine.analyze_scan(scan_result)]
+        self.execution_evidence_findings = findings
+        rows: list[list[str]] = []
+        for finding in findings:
+            timeline = " | ".join(
+                f"{entry.get('timestamp', '')} {entry.get('event', '')}: {entry.get('details', '')}".strip()
+                for entry in finding.get("timeline", [])
+            )
+            rows.append(
+                [
+                    str(finding.get("confidence", "low")),
+                    str(finding.get("title", "")),
+                    timeline,
+                    str(finding.get("explanation", "")),
+                    ", ".join(str(step) for step in finding.get("next_steps", [])),
+                ]
+            )
+        if not rows:
+            rows = [["No execution evidence detected", "", "", "No evidence-only execution indicators were assembled from the current scan.", "Review the scan and run the relevant collectors again if needed."]]
+        self._populate_table(self.execution_evidence_table, rows)
 
     def _populate_table(self, table: QTableWidget, rows: list[list[str]]) -> None:
         table.setRowCount(0)

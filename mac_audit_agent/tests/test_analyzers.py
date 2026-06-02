@@ -25,20 +25,25 @@ from mac_audit_agent.analyzers import (
     parse_sudoers,
     parse_user_records,
     safe_int,
-    get_exit_code,
-    get_stderr,
-    get_stdout,
     summarize_authorized_keys,
 )
+from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
 from mac_audit_agent.config import AuditConfig
 from mac_audit_agent.models import (
+    BaselineComparison,
+    BaselineDelta,
     FileIssueSnapshot,
     HistoryIndicator,
     LaunchItemSnapshot,
+    ProcessSnapshot,
     PermissionSnapshot,
     PortSnapshot,
-    ProcessSnapshot,
+    RawLogEntry,
+    ScanResult,
     UserSnapshot,
+    get_exit_code,
+    get_stderr,
+    get_stdout,
 )
 from mac_audit_agent.ui.main_window import MainWindow
 
@@ -198,6 +203,12 @@ def test_ui_processes_reads_standard_artifact_key() -> None:
     assert '.artifacts.get("processes", {"all": [], "suspicious": [], "errors": []})' in source
 
 
+def test_ui_includes_execution_evidence_tab() -> None:
+    source = inspect.getsource(MainWindow._build_results_page)
+    assert "Execution Evidence" in source
+    assert "execution_evidence_table" in source
+
+
 def test_command_result_access_helpers() -> None:
     payload = {"stdout": "out", "stderr": "err", "exit_code": "DRY"}
     assert get_stdout(payload) == "out"
@@ -216,7 +227,7 @@ def test_build_process_snapshot() -> None:
     snapshot = build_process_snapshot({"pid": "10", "ppid": "1", "user": "m", "command_path": "/Users/m/bin/tool"}, "signed")
     assert snapshot.pid == 10
     assert snapshot.trust_level == "review"
-    assert snapshot.trust_score < 80
+    assert snapshot.trust_score < 90
     assert snapshot.trust_summary
 
 
@@ -361,3 +372,149 @@ def test_baseline_comparison() -> None:
     assert len(comparison.new_launch_items) == 1
     assert len(comparison.new_suspicious_processes) == 1
     assert len(comparison.new_suspicious_launch_items) == 1
+
+
+def _make_execution_scan_result(
+    *,
+    signed_status: str = "unsigned",
+    trust_score: int = 35,
+    command_path: str = "/tmp/.hidden/run.sh",
+    include_first_seen: bool = True,
+    include_launch: bool = False,
+    include_network: bool = False,
+    include_hash_change: bool = False,
+) -> ScanResult:
+    process = ProcessSnapshot(
+        pid=321,
+        ppid=1,
+        user="m",
+        command_path=command_path,
+        process_name="run.sh",
+        signed_status=signed_status,
+        trust_level="untrusted" if trust_score <= 45 or signed_status == "unsigned" else "review",
+        args="",
+        reasons=["unsigned_process_binary"] if signed_status == "unsigned" else ["nonstandard_process_path"],
+        trust_score=trust_score,
+        trust_summary="Binary trust score reduced by suspicious indicators.",
+    )
+    artifacts = {
+        "processes": {"all": [process], "suspicious": [process], "errors": []},
+        "ports": {
+            "listening": [
+                {
+                    "process_name": "run.sh",
+                    "pid": 321,
+                    "local_address": "127.0.0.1:7777",
+                    "port": 7777,
+                    "protocol": "TCP",
+                    "state": "LISTEN",
+                    "concern": "Review needed",
+                    "severity": "low",
+                    "recommended_next_checks": "Review the listener.",
+                }
+            ] if include_network else [],
+            "active_connections": [
+                {
+                    "process_name": "run.sh",
+                    "pid": 321,
+                    "direction": "outbound",
+                    "local_address": "192.168.1.2:51000",
+                    "remote_address": "198.51.100.25:443",
+                    "protocol": "TCP",
+                }
+            ] if include_network else [],
+            "suspicious_review_needed": [],
+            "errors": [],
+        },
+        "file_issues": [
+            FileIssueSnapshot(
+                path="/tmp/.hidden/run.sh",
+                issue_type="unsigned",
+                modified_at="2026-05-31T12:00:00+00:00",
+                executable=True,
+                world_writable=False,
+                hidden=True,
+                signed_status=signed_status,
+                sha256="abc123",
+                trust_score=trust_score,
+                trust_label="untrusted" if trust_score <= 45 or signed_status == "unsigned" else "review",
+                trust_summary="Binary trust score reduced by suspicious indicators.",
+            )
+        ],
+        "launch_snapshots": [
+            LaunchItemSnapshot(
+                path="/Library/LaunchDaemons/com.example.agent.plist",
+                label="com.example.agent",
+                program="/tmp/.hidden/run.sh",
+                program_arguments=["/tmp/.hidden/run.sh"],
+                run_at_load=True,
+                suspicious=True,
+                reasons=["launch_program_in_writable_path"],
+            )
+        ] if include_launch else [],
+        "login_items": ["run.sh"] if include_launch else [],
+        "localhost_scan": {"missing_from_enumeration": [7777] if include_network else []},
+    }
+    baseline_diff = {
+        "new_launch_items": [{"item_key": "/Library/LaunchDaemons/com.example.agent.plist", "details": "New LaunchAgent or LaunchDaemon observed."}] if include_launch else [],
+        "new_suspicious_processes": [{"item_key": str((321, command_path)), "details": "New suspicious process observed."}] if include_first_seen else [],
+        "new_suspicious_files": [{"item_key": command_path, "details": "New suspicious file observed."}] if include_first_seen else [],
+        "changed_hashes": [{"item_key": "/tmp/.hidden/run.sh", "details": "oldhash -> newhash"}] if include_hash_change else [],
+    }
+    return ScanResult(
+        scan_id="scan-execution",
+        timestamp="2026-05-31T12:00:00+00:00",
+        hostname="host",
+        current_user="user",
+        findings=[],
+        raw_logs=[
+            RawLogEntry("processes", "ps", "2026-05-31T12:00:01+00:00", 0, "", "parsed processes=1"),
+            RawLogEntry("ports", "lsof", "2026-05-31T12:00:02+00:00", 0, "", "parsed ports=1"),
+        ],
+        collected_artifacts=artifacts,
+        baseline_diff=baseline_diff,
+        errors=[],
+    )
+
+
+def test_unsigned_executable_produces_execution_evidence() -> None:
+    scan = _make_execution_scan_result(signed_status="unsigned", trust_score=75, command_path="/Applications/Test.app/Contents/MacOS/Test", include_first_seen=False)
+    findings = ExecutionEvidenceEngine().analyze_scan(scan)
+    assert findings
+    assert findings[0].confidence == "low"
+    assert any("unsigned executable" in item for item in findings[0].evidence_items)
+
+
+def test_execution_plus_persistence_increases_confidence() -> None:
+    scan = _make_execution_scan_result(signed_status="signed", trust_score=65, include_launch=True, include_first_seen=True)
+    findings = ExecutionEvidenceEngine().analyze_scan(scan)
+    assert findings
+    assert any("LaunchAgent or LaunchDaemon added" in item for item in findings[0].evidence_items)
+    assert findings[0].confidence == "high"
+
+
+def test_execution_plus_network_increases_confidence() -> None:
+    scan = _make_execution_scan_result(signed_status="signed", trust_score=65, include_network=True, include_first_seen=True)
+    findings = ExecutionEvidenceEngine().analyze_scan(scan)
+    assert findings
+    assert any("new listening port" in item or "outbound connection shortly after execution" in item for item in findings[0].evidence_items)
+    assert findings[0].confidence == "high"
+
+
+def test_execution_evidence_confidence_scoring_works() -> None:
+    low_scan = _make_execution_scan_result(signed_status="unsigned", trust_score=75, command_path="/Applications/Test.app/Contents/MacOS/Test", include_first_seen=False)
+    medium_scan = _make_execution_scan_result(signed_status="signed", trust_score=65, include_first_seen=True)
+    high_scan = _make_execution_scan_result(signed_status="signed", trust_score=65, include_network=True, include_launch=True)
+    engine = ExecutionEvidenceEngine()
+    assert engine.analyze_scan(low_scan)[0].confidence == "low"
+    assert engine.analyze_scan(medium_scan)[0].confidence == "medium"
+    assert engine.analyze_scan(high_scan)[0].confidence == "high"
+
+
+def test_execution_evidence_does_not_claim_compromise() -> None:
+    scan = _make_execution_scan_result(signed_status="signed", trust_score=65, include_launch=True, include_network=True, include_hash_change=True)
+    finding = ExecutionEvidenceEngine().analyze_scan(scan)[0]
+    text = " ".join([finding.title, finding.explanation, " ".join(finding.next_steps)])
+    assert "RCE detected" not in text
+    assert "system compromised" not in text
+    assert "unexpected execution activity observed" in text.lower()

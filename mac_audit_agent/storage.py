@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import logging
@@ -18,6 +19,7 @@ from mac_audit_agent.models import (
     CommandExecutionResult,
     FileIssueSnapshot,
     Finding,
+    FindingSuppressionRule,
     HistoryIndicator,
     InvestigationAuditEntry,
     InvestigationNote,
@@ -39,6 +41,68 @@ from mac_audit_agent.models import (
 
 LOGGER = logging.getLogger(__name__)
 FINDING_FIELD_NAMES = {item.name for item in fields(Finding)}
+FINDING_PROVENANCE_FIELDS = {
+    "rule_id",
+    "rule_name",
+    "event_id",
+    "event_type",
+    "trigger_source",
+    "trigger_subsource",
+    "trigger_rule_id",
+    "trigger_rule_name",
+    "raw_signal_summary",
+    "normalized_signal",
+    "evidence_hash",
+    "related_process",
+    "related_pid",
+    "related_parent_pid",
+    "related_path",
+    "related_user",
+    "related_network_endpoint",
+    "related_url",
+    "related_dom_selector",
+    "related_file_hash",
+    "first_seen",
+    "last_seen",
+    "previous_state",
+    "current_state",
+    "baseline_status",
+    "correlation_id",
+    "suppression_reason",
+    "false_positive_hints",
+    "recommended_verification_steps",
+    "source_trace",
+}
+EVENT_PROVENANCE_FIELDS = {
+    "rule_id",
+    "rule_name",
+    "trigger_source",
+    "trigger_subsource",
+    "trigger_rule_id",
+    "trigger_rule_name",
+    "raw_signal_summary",
+    "normalized_signal",
+    "evidence_hash",
+    "related_process",
+    "related_pid",
+    "related_parent_pid",
+    "related_path",
+    "related_user",
+    "related_network_endpoint",
+    "related_url",
+    "related_dom_selector",
+    "related_file_hash",
+    "first_seen",
+    "last_seen",
+    "previous_state",
+    "current_state",
+    "baseline_status",
+    "correlation_id",
+    "suppression_reason",
+    "false_positive_hints",
+    "recommended_verification_steps",
+    "source_trace",
+}
 
 
 def normalize_finding_payload(payload: dict) -> dict:
@@ -80,6 +144,16 @@ def normalize_finding_payload(payload: dict) -> dict:
     normalized.setdefault("business_impact", "")
     normalized.setdefault("local_network_impact", "")
     normalized.setdefault("privilege_escalation_context", "")
+    normalized.setdefault("provenance_json", "{}")
+    provenance_json = normalized.get("provenance_json", "")
+    if isinstance(provenance_json, str) and provenance_json.strip():
+        try:
+            provenance_payload = json.loads(provenance_json)
+        except json.JSONDecodeError:
+            provenance_payload = {}
+        if isinstance(provenance_payload, dict):
+            normalized.update(provenance_payload)
+    normalized.setdefault("provenance_json", normalized.get("provenance_json", "{}"))
     normalized.setdefault("created_at", utc_timestamp_slug())
 
     return {key: value for key, value in normalized.items() if key in FINDING_FIELD_NAMES}
@@ -142,7 +216,30 @@ def normalize_finding_for_db(scan_id: str, finding: Finding | dict | Any) -> dic
         "business_impact": data.get("business_impact", ""),
         "local_network_impact": data.get("local_network_impact", ""),
         "privilege_escalation_context": data.get("privilege_escalation_context", ""),
+        "provenance_json": json.dumps({key: json_safe(data.get(key)) for key in FINDING_PROVENANCE_FIELDS if key in data}, sort_keys=True),
     }
+
+
+def normalize_event_provenance(event: BackgroundMonitorEvent | dict | Any) -> dict[str, Any]:
+    if hasattr(event, "to_dict"):
+        data = event.to_dict()
+    elif isinstance(event, dict):
+        data = dict(event)
+    else:
+        data = dict(getattr(event, "__dict__", {}))
+    return {key: json_safe(data.get(key)) for key in EVENT_PROVENANCE_FIELDS if key in data}
+
+
+def _provenance_from_json(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {key: parsed.get(key) for key in parsed.keys() if key in FINDING_PROVENANCE_FIELDS or key in EVENT_PROVENANCE_FIELDS}
 
 
 def utc_timestamp_slug() -> str:
@@ -214,6 +311,7 @@ class AuditDatabase:
         business_impact,
         local_network_impact,
         privilege_escalation_context,
+        provenance_json,
         created_at
     ) VALUES (
         :id,
@@ -248,6 +346,7 @@ class AuditDatabase:
         :business_impact,
         :local_network_impact,
         :privilege_escalation_context,
+        :provenance_json,
         :created_at
     )
     """
@@ -312,6 +411,7 @@ class AuditDatabase:
                 business_impact TEXT NOT NULL DEFAULT '',
                 local_network_impact TEXT NOT NULL DEFAULT '',
                 privilege_escalation_context TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS command_logs (
@@ -398,6 +498,135 @@ class AuditDatabase:
                 item_key TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cve_radar_cache (
+                cache_key TEXT PRIMARY KEY,
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cve_radar_alerts (
+                alert_id TEXT PRIMARY KEY,
+                cve_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kev INTEGER NOT NULL DEFAULT 0,
+                apple_related INTEGER NOT NULL DEFAULT 0,
+                applicability_confidence TEXT NOT NULL DEFAULT '',
+                published_date TEXT NOT NULL DEFAULT '',
+                last_modified_date TEXT NOT NULL DEFAULT '',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                snoozed_until TEXT NOT NULL DEFAULT '',
+                review_notes TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cve_radar_reviews (
+                review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id TEXT NOT NULL,
+                cve_id TEXT NOT NULL,
+                reviewed_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                snoozed_until TEXT NOT NULL DEFAULT '',
+                snooze_scope TEXT NOT NULL DEFAULT '',
+                version_marker TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS cve_radar_inventory (
+                inventory_id TEXT PRIMARY KEY,
+                collected_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS apple_security_forecasts (
+                forecast_id TEXT PRIMARY KEY,
+                generated_at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                source_mode TEXT NOT NULL DEFAULT '',
+                simulated INTEGER NOT NULL DEFAULT 0,
+                affected_products TEXT NOT NULL DEFAULT '[]',
+                cve_count INTEGER NOT NULL DEFAULT 0,
+                kev_count INTEGER NOT NULL DEFAULT 0,
+                highest_severity TEXT NOT NULL DEFAULT 'info',
+                recommended_action TEXT NOT NULL DEFAULT '',
+                previous_level TEXT NOT NULL DEFAULT '',
+                next_check_at TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS apple_security_forecast_cards (
+                card_id TEXT PRIMARY KEY,
+                forecast_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                forecast_level TEXT NOT NULL,
+                simulated INTEGER NOT NULL DEFAULT 0,
+                affected_local_product TEXT NOT NULL DEFAULT '',
+                detected_version TEXT NOT NULL DEFAULT '',
+                fixed_version TEXT NOT NULL DEFAULT '',
+                cves TEXT NOT NULL DEFAULT '[]',
+                kev_cves TEXT NOT NULL DEFAULT '[]',
+                epss_high_cves TEXT NOT NULL DEFAULT '[]',
+                applicability TEXT NOT NULL DEFAULT '',
+                confidence TEXT NOT NULL DEFAULT '',
+                why_shown TEXT NOT NULL DEFAULT '',
+                what_to_do TEXT NOT NULL DEFAULT '',
+                update_path TEXT NOT NULL DEFAULT '',
+                references_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'new',
+                snooze_until TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS apple_security_cve_cache (
+                cve_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS apple_security_review_state (
+                card_id TEXT PRIMARY KEY,
+                cve_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'new',
+                reviewed_at TEXT NOT NULL DEFAULT '',
+                snooze_until TEXT NOT NULL DEFAULT '',
+                snooze_scope TEXT NOT NULL DEFAULT '',
+                version_marker TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS system_recovery_baselines (
+                baseline_key TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                path TEXT NOT NULL,
+                baseline_bytes INTEGER NOT NULL DEFAULT 0,
+                observed_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS system_recovery_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                snapshot_path TEXT NOT NULL,
+                assessment_level TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE TABLE IF NOT EXISTS system_cleanup_actions (
+                action_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                risk_level TEXT NOT NULL DEFAULT '',
+                snapshot_id TEXT NOT NULL DEFAULT '',
+                preview_json TEXT NOT NULL DEFAULT '{}',
+                rollback_json TEXT NOT NULL DEFAULT '{}',
+                deleted_json TEXT NOT NULL DEFAULT '[]',
+                result_text TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
             CREATE TABLE IF NOT EXISTS background_monitor_events (
                 event_id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -417,7 +646,8 @@ class AuditDatabase:
                 notification_reason TEXT NOT NULL DEFAULT '',
                 cooldown_remaining_seconds INTEGER NOT NULL DEFAULT 0,
                 popup_allowed INTEGER NOT NULL DEFAULT 0,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                provenance_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS background_monitor_state (
                 key TEXT PRIMARY KEY,
@@ -452,6 +682,18 @@ class AuditDatabase:
                 notes TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (item_type, item_key, linked_scan_id)
             );
+            CREATE TABLE IF NOT EXISTS finding_suppression_rules (
+                fingerprint TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                review_state TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                matched_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS investigation_audit_trail (
                 audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -482,8 +724,54 @@ class AuditDatabase:
         self._ensure_column("findings", "business_impact", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("findings", "local_network_impact", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("findings", "privilege_escalation_context", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("findings", "provenance_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("network_discovery_runs", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
         self._ensure_column("network_discovery_hosts", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("cve_radar_cache", "expires_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "applicability_confidence", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "published_date", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "last_modified_date", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "first_seen", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "last_seen", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "snoozed_until", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_alerts", "review_notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_reviews", "notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_reviews", "snoozed_until", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_reviews", "snooze_scope", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_reviews", "version_marker", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("cve_radar_reviews", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("cve_radar_inventory", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("apple_security_forecasts", "affected_products", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("apple_security_forecasts", "source_mode", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_forecasts", "simulated", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("apple_security_forecasts", "previous_level", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_forecasts", "next_check_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_forecasts", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("apple_security_forecast_cards", "simulated", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("apple_security_forecast_cards", "kev_cves", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("apple_security_forecast_cards", "epss_high_cves", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("apple_security_forecast_cards", "references_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("apple_security_forecast_cards", "snooze_until", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_forecast_cards", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("apple_security_cve_cache", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("apple_security_review_state", "reviewed_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_review_state", "snooze_until", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_review_state", "snooze_scope", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_review_state", "version_marker", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_review_state", "notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("apple_security_review_state", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("system_recovery_baselines", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("system_recovery_snapshots", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("system_cleanup_actions", "preview_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("system_cleanup_actions", "rollback_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("system_cleanup_actions", "deleted_json", "TEXT NOT NULL DEFAULT '[]'")
+        self._ensure_column("system_cleanup_actions", "result_text", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("system_cleanup_actions", "payload_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("finding_suppression_rules", "rationale", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("finding_suppression_rules", "active", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("finding_suppression_rules", "matched_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("finding_suppression_rules", "first_seen_at", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("finding_suppression_rules", "last_seen_at", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("background_monitor_events", "simulated", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("background_monitor_events", "notification_sent", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("background_monitor_events", "notification_error", "TEXT NOT NULL DEFAULT ''")
@@ -493,6 +781,7 @@ class AuditDatabase:
         self._ensure_column("background_monitor_events", "cooldown_remaining_seconds", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("background_monitor_events", "popup_allowed", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("background_monitor_events", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        self._ensure_column("background_monitor_events", "provenance_json", "TEXT NOT NULL DEFAULT '{}'")
         self._migrate_command_logs_exit_code_nullable()
         self.conn.commit()
 
@@ -550,6 +839,48 @@ class AuditDatabase:
         )
         self.conn.commit()
 
+    def list_scan_summaries(self, limit: int = 50) -> list[ScanSummary]:
+        rows = self.conn.execute(
+            "SELECT * FROM scans ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            ScanSummary(
+                scan_id=str(row["scan_id"]),
+                started_at=str(row["started_at"]),
+                completed_at=str(row["completed_at"]),
+                findings_count=int(row["findings_count"]),
+                security_score=None if int(row["security_score"]) < 0 else int(row["security_score"]),
+                notes=str(row["notes"]),
+                new_items_count=int(row["new_items_count"]),
+                score_label=str(row["score_label"] or ""),
+            )
+            for row in rows
+        ]
+
+    def list_scan_summaries_between(self, start_timestamp: str, end_timestamp: str) -> list[ScanSummary]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM scans
+            WHERE completed_at >= ? AND completed_at <= ?
+            ORDER BY completed_at ASC
+            """,
+            (start_timestamp, end_timestamp),
+        ).fetchall()
+        return [
+            ScanSummary(
+                scan_id=str(row["scan_id"]),
+                started_at=str(row["started_at"]),
+                completed_at=str(row["completed_at"]),
+                findings_count=int(row["findings_count"]),
+                security_score=None if int(row["security_score"]) < 0 else int(row["security_score"]),
+                notes=str(row["notes"]),
+                new_items_count=int(row["new_items_count"]),
+                score_label=str(row["score_label"] or ""),
+            )
+            for row in rows
+        ]
+
     def record_scan_result(self, scan_result: ScanResult) -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO scan_results (scan_id, payload_json) VALUES (?, ?)",
@@ -586,6 +917,25 @@ class AuditDatabase:
             return self._scan_result_from_payload(json.loads(row["payload_json"]))
         except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
             LOGGER.exception("Failed to hydrate scan result %s: %s", scan_id, exc)
+            return None
+
+    def get_finding_by_id(self, finding_id: str) -> Finding | None:
+        row = self.conn.execute("SELECT * FROM findings WHERE id = ? OR finding_id = ? ORDER BY created_at DESC LIMIT 1", (finding_id, finding_id)).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        payload["remediation_steps"] = json.loads(payload.get("remediation_steps", "[]") or "[]")
+        payload["remediation_commands"] = json.loads(payload.get("remediation_commands", "[]") or "[]")
+        payload["verification_steps"] = json.loads(payload.get("verification_steps", "[]") or "[]")
+        payload["remediation_references"] = json.loads(payload.get("remediation_references", "[]") or "[]")
+        payload["redacted"] = bool(payload.get("redacted", 0))
+        payload["needs_admin_for_followup"] = bool(payload.get("needs_admin_for_followup", 0))
+        payload["requires_admin"] = bool(payload.get("requires_admin", 0))
+        payload["reversible"] = bool(payload.get("reversible", 1))
+        payload.update(_provenance_from_json(payload.get("provenance_json", "{}")))
+        try:
+            return Finding(**normalize_finding_payload(payload))
+        except Exception:
             return None
 
     def _scan_result_from_payload(self, payload: dict) -> ScanResult:
@@ -846,7 +1196,477 @@ class AuditDatabase:
 
     def latest_findings(self, limit: int = 100) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM findings ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(row) for row in rows]
+        results = []
+        for row in rows:
+            payload = dict(row)
+            payload.update(_provenance_from_json(payload.get("provenance_json", "{}")))
+            results.append(payload)
+        return results
+
+    def record_cve_radar_cache(
+        self,
+        payload: dict[str, Any],
+        *,
+        cache_key: str = "latest",
+        source: str = "catalog",
+        updated_at: str | None = None,
+        expires_at: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO cve_radar_cache (cache_key, updated_at, source, expires_at, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                cache_key,
+                updated_at or utc_now_iso(),
+                source,
+                expires_at,
+                json.dumps(json_safe(payload)),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_cve_radar_cache(self, cache_key: str = "latest") -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM cve_radar_cache WHERE cache_key = ? ORDER BY updated_at DESC LIMIT 1", (cache_key,)).fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        try:
+            payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+        except json.JSONDecodeError:
+            payload["payload_json"] = {}
+        return payload
+
+    def record_cve_radar_inventory(self, payload: dict[str, Any], *, inventory_id: str | None = None, source: str = "local-inventory") -> None:
+        collected_at = str(payload.get("collected_at") or utc_now_iso())
+        inventory_id = inventory_id or str(payload.get("inventory_id") or collected_at)
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO cve_radar_inventory (inventory_id, collected_at, source, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (inventory_id, collected_at, source, json.dumps(json_safe(payload))),
+        )
+        self.conn.commit()
+
+    def latest_cve_radar_inventory(self) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM cve_radar_inventory ORDER BY collected_at DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        try:
+            payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+        except json.JSONDecodeError:
+            payload["payload_json"] = {}
+        return payload
+
+    def record_apple_security_forecast(self, forecast: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO apple_security_forecasts
+            (forecast_id, generated_at, level, summary, source_mode, simulated, affected_products, cve_count, kev_count, highest_severity, recommended_action, previous_level, next_check_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(forecast.get("forecast_id", "")),
+                str(forecast.get("generated_at", utc_now_iso())),
+                str(forecast.get("level", "clear")),
+                str(forecast.get("summary", "")),
+                str(forecast.get("source_mode", "")),
+                int(bool(forecast.get("simulated", False))),
+                json.dumps(json_safe(forecast.get("affected_products", []))),
+                int(forecast.get("cve_count", 0) or 0),
+                int(forecast.get("kev_count", 0) or 0),
+                str(forecast.get("highest_severity", "info")),
+                str(forecast.get("recommended_action", "")),
+                str(forecast.get("previous_level", "")),
+                str(forecast.get("next_check_at", "")),
+                json.dumps(json_safe(forecast), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_apple_security_forecast(self) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM apple_security_forecasts ORDER BY generated_at DESC LIMIT 1").fetchone()
+        if not row:
+            return None
+        payload = dict(row)
+        try:
+            payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+        except json.JSONDecodeError:
+            payload["payload_json"] = {}
+        try:
+            payload["affected_products"] = json.loads(payload.get("affected_products", "[]") or "[]")
+        except json.JSONDecodeError:
+            payload["affected_products"] = []
+        payload["simulated"] = bool(payload.get("simulated", 0))
+        payload["source_mode"] = str(payload.get("source_mode", ""))
+        return payload
+
+    def record_apple_security_forecast_cards(self, cards: list[dict[str, Any]]) -> None:
+        for card in cards:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO apple_security_forecast_cards
+                (card_id, forecast_id, title, category, forecast_level, simulated, affected_local_product, detected_version, fixed_version, cves, kev_cves, epss_high_cves, applicability, confidence, why_shown, what_to_do, update_path, references_json, status, snooze_until, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(card.get("card_id", "")),
+                    str(card.get("forecast_id", "")),
+                    str(card.get("title", "")),
+                    str(card.get("category", "")),
+                    str(card.get("forecast_level", "")),
+                    int(bool(card.get("simulated", False))),
+                    str(card.get("affected_local_product", "")),
+                    str(card.get("detected_version", "")),
+                    str(card.get("fixed_version", "")),
+                    json.dumps(json_safe(card.get("cves", []))),
+                    json.dumps(json_safe(card.get("kev_cves", []))),
+                    json.dumps(json_safe(card.get("epss_high_cves", []))),
+                    str(card.get("applicability", "")),
+                    str(card.get("confidence", "")),
+                    str(card.get("why_shown", "")),
+                    str(card.get("what_to_do", "")),
+                    str(card.get("update_path", "")),
+                    json.dumps(json_safe(card.get("references", []))),
+                    str(card.get("status", "new")),
+                    str(card.get("snooze_until", "")),
+                    json.dumps(json_safe(card), sort_keys=True),
+                ),
+            )
+        self.conn.commit()
+
+    def list_apple_security_forecast_cards(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM apple_security_forecast_cards ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            for key in ["cves", "kev_cves", "epss_high_cves", "references_json"]:
+                try:
+                    payload[key] = json.loads(payload.get(key, "[]") or "[]")
+                except json.JSONDecodeError:
+                    payload[key] = []
+            payload["simulated"] = bool(payload.get("simulated", 0))
+            results.append(payload)
+        return results
+
+    def delete_apple_security_forecast(self, forecast_id: str) -> None:
+        self.conn.execute("DELETE FROM apple_security_forecast_cards WHERE forecast_id = ?", (forecast_id,))
+        self.conn.execute("DELETE FROM apple_security_forecasts WHERE forecast_id = ?", (forecast_id,))
+        self.conn.commit()
+
+    def record_apple_security_cve_cache(self, cve_id: str, payload: dict[str, Any], *, source: str) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO apple_security_cve_cache (cve_id, source, updated_at, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (cve_id, source, utc_now_iso(), json.dumps(json_safe(payload), sort_keys=True)),
+        )
+        self.conn.commit()
+
+    def latest_apple_security_cve_cache(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM apple_security_cve_cache ORDER BY updated_at DESC").fetchall()
+        cached: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            cached.append(payload)
+        return cached
+
+    def record_apple_security_review_state(
+        self,
+        card_id: str,
+        *,
+        cve_id: str = "",
+        status: str = "new",
+        snooze_until: str = "",
+        snooze_scope: str = "",
+        version_marker: str = "",
+        notes: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO apple_security_review_state
+            (card_id, cve_id, status, reviewed_at, snooze_until, snooze_scope, version_marker, notes, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                card_id,
+                cve_id,
+                status,
+                utc_now_iso(),
+                snooze_until,
+                snooze_scope,
+                version_marker,
+                notes,
+                json.dumps(json_safe(payload or {}), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def record_system_recovery_baseline(self, baseline: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO system_recovery_baselines
+            (baseline_key, category, path, baseline_bytes, observed_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(baseline.get("baseline_key", "")),
+                str(baseline.get("category", "")),
+                str(baseline.get("path", "")),
+                int(baseline.get("baseline_bytes", 0) or 0),
+                str(baseline.get("observed_at", utc_now_iso())),
+                json.dumps(json_safe(baseline), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_system_recovery_baselines(self, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM system_recovery_baselines ORDER BY observed_at DESC LIMIT ?", (limit,)).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            results.append(payload)
+        return results
+
+    def record_system_recovery_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO system_recovery_snapshots
+            (snapshot_id, created_at, snapshot_path, assessment_level, payload_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(snapshot.get("snapshot_id", "")),
+                str(snapshot.get("created_at", utc_now_iso())),
+                str(snapshot.get("snapshot_path", "")),
+                str(snapshot.get("assessment_level", "")),
+                json.dumps(json_safe(snapshot), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_system_recovery_snapshots(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM system_recovery_snapshots ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            results.append(payload)
+        return results
+
+    def record_system_cleanup_action(self, action: dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO system_cleanup_actions
+            (action_id, created_at, action_type, category, risk_level, snapshot_id, preview_json, rollback_json, deleted_json, result_text, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(action.get("action_id", "")),
+                str(action.get("created_at", utc_now_iso())),
+                str(action.get("action_type", "")),
+                str(action.get("category", "")),
+                str(action.get("risk_level", "")),
+                str(action.get("snapshot_id", "")),
+                json.dumps(json_safe(action.get("preview_json", {})), sort_keys=True),
+                json.dumps(json_safe(action.get("rollback_json", {})), sort_keys=True),
+                json.dumps(json_safe(action.get("deleted_json", [])), sort_keys=True),
+                str(action.get("result_text", "")),
+                json.dumps(json_safe(action), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_system_cleanup_actions(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM system_cleanup_actions ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            for key in ["preview_json", "rollback_json", "deleted_json", "payload_json"]:
+                try:
+                    payload[key] = json.loads(payload.get(key, "{}" if key != "deleted_json" else "[]") or ("[]" if key == "deleted_json" else "{}"))
+                except json.JSONDecodeError:
+                    payload[key] = [] if key == "deleted_json" else {}
+            results.append(payload)
+        return results
+
+    def latest_apple_security_review_state(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM apple_security_review_state ORDER BY reviewed_at DESC").fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            results.append(payload)
+        return results
+
+    def _cve_radar_alert_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        raw = str(payload.get("payload_json", "{}") or "{}")
+        try:
+            details = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            details = {}
+        if isinstance(details, dict):
+            payload.update(details)
+        payload["kev"] = bool(payload.get("kev", 0))
+        payload["apple_related"] = bool(payload.get("apple_related", 0))
+        return payload
+
+    def record_cve_radar_alerts(self, alerts: list[dict[str, Any]]) -> None:
+        existing_rows = {
+            str(row["alert_id"]): row
+            for row in self.conn.execute("SELECT * FROM cve_radar_alerts").fetchall()
+        }
+        for alert in alerts:
+            alert_id = str(alert.get("alert_id", "")).strip()
+            if not alert_id:
+                continue
+            current = existing_rows.get(alert_id)
+            status = str(alert.get("status", "") or "")
+            if not status:
+                status = str(current["status"]) if current else "new"
+            snoozed_until = str(alert.get("snoozed_until", "") or (current["snoozed_until"] if current else ""))
+            review_notes = str(alert.get("review_notes", "") or (current["review_notes"] if current else ""))
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO cve_radar_alerts
+                (alert_id, cve_id, title, severity, confidence, status, source, kev, apple_related, applicability_confidence, published_date, last_modified_date, first_seen, last_seen, snoozed_until, review_notes, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alert_id,
+                    str(alert.get("cve_id", "")),
+                    str(alert.get("title", "")),
+                    str(alert.get("severity", "medium")),
+                    str(alert.get("confidence", alert.get("applicability_confidence", "low"))),
+                    status,
+                    str(alert.get("source", "nvd")),
+                    int(bool(alert.get("kev", False))),
+                    int(bool(alert.get("apple_related", False))),
+                    str(alert.get("applicability_confidence", "low")),
+                    str(alert.get("published_date", "")),
+                    str(alert.get("last_modified_date", "")),
+                    str(alert.get("first_seen", utc_now_iso())),
+                    str(alert.get("last_seen", utc_now_iso())),
+                    snoozed_until,
+                    review_notes,
+                    json.dumps(json_safe(alert), sort_keys=True),
+                ),
+            )
+        self.conn.commit()
+
+    def list_cve_radar_alerts(self, *, limit: int = 200, status: str | None = None) -> list[dict[str, Any]]:
+        if status:
+            rows = self.conn.execute(
+                "SELECT * FROM cve_radar_alerts WHERE status = ? ORDER BY last_seen DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM cve_radar_alerts ORDER BY last_seen DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._cve_radar_alert_from_row(row) for row in rows]
+
+    def get_cve_radar_alert(self, alert_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM cve_radar_alerts WHERE alert_id = ?", (alert_id,)).fetchone()
+        return self._cve_radar_alert_from_row(row) if row else None
+
+    def set_cve_radar_alert_status(
+        self,
+        alert_id: str,
+        *,
+        status: str,
+        notes: str = "",
+        snoozed_until: str = "",
+        snooze_scope: str = "",
+        version_marker: str = "",
+        action: str = "review",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        row = self.conn.execute("SELECT * FROM cve_radar_alerts WHERE alert_id = ?", (alert_id,)).fetchone()
+        if not row:
+            return
+        alert = self._cve_radar_alert_from_row(row)
+        if payload:
+            alert.update(payload)
+        alert["status"] = status
+        alert["review_notes"] = notes
+        alert["snoozed_until"] = snoozed_until
+        alert["last_seen"] = utc_now_iso()
+        self.conn.execute(
+            """
+            UPDATE cve_radar_alerts
+            SET status = ?, snoozed_until = ?, review_notes = ?, last_seen = ?, payload_json = ?
+            WHERE alert_id = ?
+            """,
+            (
+                status,
+                snoozed_until,
+                notes,
+                alert["last_seen"],
+                json.dumps(json_safe(alert), sort_keys=True),
+                alert_id,
+            ),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO cve_radar_reviews
+            (alert_id, cve_id, reviewed_at, action, status, notes, snoozed_until, snooze_scope, version_marker, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert_id,
+                str(alert.get("cve_id", "")),
+                utc_now_iso(),
+                action,
+                status,
+                notes,
+                snoozed_until,
+                snooze_scope,
+                version_marker,
+                json.dumps(json_safe(alert), sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def list_cve_radar_reviews(self, limit: int = 200) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM cve_radar_reviews ORDER BY reviewed_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            try:
+                payload["payload_json"] = json.loads(payload.get("payload_json", "{}") or "{}")
+            except json.JSONDecodeError:
+                payload["payload_json"] = {}
+            results.append(payload)
+        return results
 
     def record_background_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 60) -> bool:
         row = self.conn.execute(
@@ -876,8 +1696,8 @@ class AuditDatabase:
         self.conn.execute(
             """
             INSERT OR REPLACE INTO background_monitor_events
-            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (event_id, timestamp, event_type, severity, source, process_name, pid, evidence, confidence, recommendation, simulated, notification_sent, notification_error, notification_returncode, notification_decision, notification_reason, cooldown_remaining_seconds, popup_allowed, metadata_json, provenance_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.event_id,
@@ -899,6 +1719,7 @@ class AuditDatabase:
                 event.cooldown_remaining_seconds,
                 int(bool(event.popup_allowed)),
                 event.metadata_json,
+                json.dumps(normalize_event_provenance(event), sort_keys=True),
             ),
         )
         self.set_background_monitor_state("last_event_timestamp", event.timestamp)
@@ -907,6 +1728,39 @@ class AuditDatabase:
 
     def record_monitor_event(self, event: BackgroundMonitorEvent, dedupe_window_seconds: int = 300) -> bool:
         return self.record_background_monitor_event(event, dedupe_window_seconds=dedupe_window_seconds)
+
+    def _background_event_from_row(self, row: sqlite3.Row) -> BackgroundMonitorEvent:
+        provenance: dict[str, Any] = {}
+        raw_provenance = str(row["provenance_json"] or "{}")
+        if raw_provenance:
+            try:
+                parsed = json.loads(raw_provenance)
+                if isinstance(parsed, dict):
+                    provenance = parsed
+            except json.JSONDecodeError:
+                provenance = {}
+        return BackgroundMonitorEvent(
+            event_id=str(row["event_id"]),
+            timestamp=str(row["timestamp"]),
+            event_type=str(row["event_type"]),
+            severity=str(row["severity"]),
+            source=str(row["source"]),
+            process_name=str(row["process_name"] or ""),
+            pid=safe_int(row["pid"]),
+            evidence=str(row["evidence"]),
+            confidence=str(row["confidence"]),
+            recommendation=str(row["recommendation"]),
+            simulated=bool(row["simulated"]),
+            notification_sent=bool(row["notification_sent"]),
+            notification_error=str(row["notification_error"] or ""),
+            notification_returncode=safe_int(row["notification_returncode"]),
+            notification_decision=str(row["notification_decision"] or "log_only"),
+            notification_reason=str(row["notification_reason"] or ""),
+            cooldown_remaining_seconds=safe_int(row["cooldown_remaining_seconds"]) or 0,
+            popup_allowed=bool(row["popup_allowed"]),
+            metadata_json=str(row["metadata_json"] or "{}"),
+            **{key: value for key, value in provenance.items() if key in EVENT_PROVENANCE_FIELDS},
+        )
 
     def update_monitor_event_notification(
         self,
@@ -956,32 +1810,26 @@ class AuditDatabase:
                 (limit,),
             ).fetchall()
         return [
-            BackgroundMonitorEvent(
-                event_id=str(row["event_id"]),
-                timestamp=str(row["timestamp"]),
-                event_type=str(row["event_type"]),
-                severity=str(row["severity"]),
-                source=str(row["source"]),
-                process_name=str(row["process_name"] or ""),
-                pid=safe_int(row["pid"]),
-                evidence=str(row["evidence"]),
-                confidence=str(row["confidence"]),
-                recommendation=str(row["recommendation"]),
-                simulated=bool(row["simulated"]),
-                notification_sent=bool(row["notification_sent"]),
-                notification_error=str(row["notification_error"] or ""),
-                notification_returncode=safe_int(row["notification_returncode"]),
-                notification_decision=str(row["notification_decision"] or "log_only"),
-                notification_reason=str(row["notification_reason"] or ""),
-                cooldown_remaining_seconds=safe_int(row["cooldown_remaining_seconds"]) or 0,
-                popup_allowed=bool(row["popup_allowed"]),
-                metadata_json=str(row["metadata_json"] or "{}"),
-            )
+            self._background_event_from_row(row)
             for row in rows
         ]
 
     def latest_monitor_events(self, limit: int = 100) -> list[BackgroundMonitorEvent]:
         return self.recent_background_monitor_events(limit=limit)
+
+    def background_monitor_events_between(self, start_timestamp: str, end_timestamp: str) -> list[BackgroundMonitorEvent]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM background_monitor_events
+            WHERE timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC
+            """,
+            (start_timestamp, end_timestamp),
+        ).fetchall()
+        return [
+            self._background_event_from_row(row)
+            for row in rows
+        ]
 
     def clear_monitor_events(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS count FROM background_monitor_events").fetchone()
@@ -1048,8 +1896,11 @@ class AuditDatabase:
             detector_last_run_counts=self.get_background_monitor_state("detector_last_run_counts", ""),
             detector_enabled_camera=self.get_background_monitor_state("detector_enabled_camera", "0") == "1",
             detector_enabled_session=self.get_background_monitor_state("detector_enabled_session", "0") == "1",
+            detector_enabled_network=self.get_background_monitor_state("detector_enabled_network", "0") == "1",
+            detector_enabled_persistence=self.get_background_monitor_state("detector_enabled_persistence", "0") == "1",
             detector_enabled_sharing=self.get_background_monitor_state("detector_enabled_sharing", "0") == "1",
             detector_enabled_process=self.get_background_monitor_state("detector_enabled_process", "0") == "1",
+            detector_enabled_hardware=self.get_background_monitor_state("detector_enabled_hardware", "0") == "1",
             detector_last_zero_reason=self.get_background_monitor_state("detector_last_zero_reason", ""),
             status_text=self.get_background_monitor_state("status_text", ""),
             current_snapshot=self.get_background_monitor_state("current_monitor_snapshot", ""),
@@ -1172,6 +2023,10 @@ class AuditDatabase:
             details=label,
         )
         self.conn.commit()
+        if item_type == "finding" and review_state in {"false positive", "resolved"} and linked_finding_id:
+            finding = self.get_finding_by_id(linked_finding_id)
+            if finding is not None:
+                self.record_finding_suppression(finding, review_state=review_state, rationale=notes or label)
 
     def get_review_statuses(self, linked_scan_id: str) -> dict[tuple[str, str], ReviewChecklistItem]:
         rows = self.conn.execute(
@@ -1191,6 +2046,100 @@ class AuditDatabase:
             )
             for row in rows
         }
+
+    def record_finding_suppression(self, finding: Finding, *, review_state: str, rationale: str = "") -> None:
+        fingerprint = self._finding_fingerprint(finding)
+        timestamp = utc_now_iso()
+        existing = self.conn.execute(
+            "SELECT matched_count, first_seen_at FROM finding_suppression_rules WHERE fingerprint = ?",
+            (fingerprint,),
+        ).fetchone()
+        matched_count = int(existing["matched_count"]) + 1 if existing else 1
+        first_seen_at = str(existing["first_seen_at"]) if existing else timestamp
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO finding_suppression_rules
+            (fingerprint, title, category, severity, review_state, rationale, active, matched_count, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fingerprint,
+                finding.title,
+                finding.category,
+                finding.severity,
+                review_state,
+                rationale,
+                1,
+                matched_count,
+                first_seen_at,
+                timestamp,
+            ),
+        )
+        self._record_investigation_audit(
+            action_type="finding suppression learned",
+            entity_type="finding",
+            entity_id=fingerprint,
+            previous_status=review_state,
+            new_status="active",
+            details=f"{finding.category}: {finding.title}",
+        )
+        self.conn.commit()
+
+    def list_finding_suppressions(self, limit: int = 500) -> list[FindingSuppressionRule]:
+        rows = self.conn.execute(
+            "SELECT * FROM finding_suppression_rules ORDER BY last_seen_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            FindingSuppressionRule(
+                fingerprint=str(row["fingerprint"]),
+                title=str(row["title"]),
+                category=str(row["category"]),
+                severity=str(row["severity"]),
+                review_state=str(row["review_state"]),
+                rationale=str(row["rationale"]),
+                active=bool(row["active"]),
+                matched_count=int(row["matched_count"]),
+                first_seen_at=str(row["first_seen_at"]),
+                last_seen_at=str(row["last_seen_at"]),
+            )
+            for row in rows
+        ]
+
+    def find_suppression_rule(self, finding: Finding | dict[str, Any]) -> FindingSuppressionRule | None:
+        fingerprint = self._finding_fingerprint(finding)
+        row = self.conn.execute("SELECT * FROM finding_suppression_rules WHERE fingerprint = ?", (fingerprint,)).fetchone()
+        if not row:
+            return None
+        return FindingSuppressionRule(
+            fingerprint=str(row["fingerprint"]),
+            title=str(row["title"]),
+            category=str(row["category"]),
+            severity=str(row["severity"]),
+            review_state=str(row["review_state"]),
+            rationale=str(row["rationale"]),
+            active=bool(row["active"]),
+            matched_count=int(row["matched_count"]),
+            first_seen_at=str(row["first_seen_at"]),
+            last_seen_at=str(row["last_seen_at"]),
+        )
+
+    def _finding_fingerprint(self, finding: Finding | dict[str, Any]) -> str:
+        if hasattr(finding, "to_dict"):
+            payload = finding.to_dict()
+        elif isinstance(finding, dict):
+            payload = dict(finding)
+        else:
+            payload = dict(getattr(finding, "__dict__", {}))
+        evidence = str(payload.get("evidence_summary") or payload.get("evidence") or payload.get("recommendation") or "")
+        basis = {
+            "category": str(payload.get("category", "")),
+            "title": str(payload.get("title", "")),
+            "severity": str(payload.get("severity", "")),
+            "command": str(payload.get("command_used") or payload.get("command_or_source") or ""),
+            "evidence": evidence[:240],
+        }
+        return hashlib.sha256(json.dumps(basis, sort_keys=True).encode("utf-8")).hexdigest()
 
     def investigation_progress(self, linked_scan_id: str, total_findings: int) -> dict[str, int]:
         rows = self.conn.execute(
@@ -1218,6 +2167,29 @@ class AuditDatabase:
         rows = self.conn.execute(
             "SELECT * FROM investigation_audit_trail ORDER BY timestamp DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [
+            InvestigationAuditEntry(
+                audit_id=row["audit_id"],
+                timestamp=row["timestamp"],
+                action_type=row["action_type"],
+                entity_type=row["entity_type"],
+                entity_id=row["entity_id"],
+                previous_status=row["previous_status"],
+                new_status=row["new_status"],
+                details=row["details"],
+            )
+            for row in rows
+        ]
+
+    def investigation_audit_trail_between(self, start_timestamp: str, end_timestamp: str) -> list[InvestigationAuditEntry]:
+        rows = self.conn.execute(
+            """
+            SELECT * FROM investigation_audit_trail
+            WHERE timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC
+            """,
+            (start_timestamp, end_timestamp),
         ).fetchall()
         return [
             InvestigationAuditEntry(
@@ -1406,6 +2378,17 @@ class AuditDatabase:
         return {
             "scans": [dict(row) for row in self.conn.execute("SELECT * FROM scans ORDER BY completed_at DESC")],
             "findings": [dict(row) for row in self.conn.execute("SELECT * FROM findings ORDER BY created_at DESC")],
+            "cve_radar_cache": [dict(row) for row in self.conn.execute("SELECT * FROM cve_radar_cache ORDER BY updated_at DESC")],
+            "cve_radar_alerts": [self._cve_radar_alert_from_row(row) for row in self.conn.execute("SELECT * FROM cve_radar_alerts ORDER BY last_seen DESC")],
+            "cve_radar_reviews": [item for item in self.list_cve_radar_reviews(limit=5000)],
+            "cve_radar_inventory": [dict(row) for row in self.conn.execute("SELECT * FROM cve_radar_inventory ORDER BY collected_at DESC")],
+            "apple_security_forecasts": [dict(row) for row in self.conn.execute("SELECT * FROM apple_security_forecasts ORDER BY generated_at DESC")],
+            "apple_security_forecast_cards": [dict(row) for row in self.conn.execute("SELECT * FROM apple_security_forecast_cards ORDER BY forecast_id DESC, card_id ASC")],
+            "apple_security_cve_cache": [dict(row) for row in self.conn.execute("SELECT * FROM apple_security_cve_cache ORDER BY updated_at DESC")],
+            "apple_security_review_state": [dict(row) for row in self.conn.execute("SELECT * FROM apple_security_review_state ORDER BY reviewed_at DESC")],
+            "system_recovery_baselines": [dict(row) for row in self.conn.execute("SELECT * FROM system_recovery_baselines ORDER BY observed_at DESC")],
+            "system_recovery_snapshots": [dict(row) for row in self.conn.execute("SELECT * FROM system_recovery_snapshots ORDER BY created_at DESC")],
+            "system_cleanup_actions": [dict(row) for row in self.conn.execute("SELECT * FROM system_cleanup_actions ORDER BY created_at DESC")],
             "command_logs": [dict(row) for row in self.conn.execute("SELECT * FROM command_logs ORDER BY executed_at DESC")],
             "user_approvals": [dict(row) for row in self.conn.execute("SELECT * FROM user_approvals ORDER BY approved_at DESC")],
             "remediation_actions": [dict(row) for row in self.conn.execute("SELECT * FROM remediation_actions ORDER BY created_at DESC")],

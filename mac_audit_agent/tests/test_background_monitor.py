@@ -3,6 +3,7 @@ import json
 import plistlib
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -17,18 +18,25 @@ from mac_audit_agent.launch_agent import (
     build_launch_agent_plist,
     launchctl_target,
     project_root,
+    default_monitor_db_path,
+    monitor_log_root,
     runtime_monitor_script_path,
     runtime_package_root,
     runtime_root,
 )
-from mac_audit_agent.models import BackgroundMonitorEvent, ScanResult
+from mac_audit_agent.hardware_monitor import HardwareMonitor, HardwareMonitorSnapshot, USBReconnectObserver
+from mac_audit_agent.models import BackgroundMonitorEvent, Finding, ScanResult, ScanSummary
 from mac_audit_agent.monitor import FALLBACK_MONITOR_LOG, BackgroundMonitorService, STDERR_MONITOR_LOG, clear_monitor_log_files, is_heartbeat_fresh, is_pid_alive, main as monitor_main
+from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceSnapshot
+from mac_audit_agent.network_monitor import NetworkMonitor, NetworkMonitorSnapshot
 from mac_audit_agent.notification_manager import NotificationManager, applescript_escape, send_alert_dialog, send_notification
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
 from mac_audit_agent.reporting import export_scan_result_html, export_scan_result_json
-from mac_audit_agent.session_monitor import SessionMonitor
+from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
 from mac_audit_agent.storage import AuditDatabase
+from mac_audit_agent.rules import sanitize_signal_text
 from mac_audit_agent.ui.background_monitor_panel import BackgroundMonitorPanel
+from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 
 
 class FakeCompletedProcess:
@@ -36,6 +44,14 @@ class FakeCompletedProcess:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+class FakePopenProcess:
+    def __init__(self, returncode=None) -> None:
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
 
 
 class FakeLaunchAgent:
@@ -96,6 +112,26 @@ def test_launch_agent_plist_generated_correctly(tmp_path: Path) -> None:
     assert payload["StandardOutPath"].endswith("background_monitor.stdout.log")
     assert payload["StandardErrorPath"].endswith("background_monitor.stderr.log")
     plistlib.dumps(payload)
+
+
+def test_launch_daemon_plist_generated_correctly(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_RUNTIME_ROOT", tmp_path / "system-runtime")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_LOG_ROOT", tmp_path / "system-logs")
+    monkeypatch.setattr("mac_audit_agent.launch_agent.SYSTEM_DB_PATH", tmp_path / "system.sqlite3")
+    payload = build_launch_agent_plist(db_path=tmp_path / "system.sqlite3", poll_interval_seconds=30, python_executable="/usr/bin/python3", scope="system")
+    assert payload["Label"] == LAUNCH_AGENT_LABEL
+    assert payload["ProgramArguments"] == ["/usr/bin/python3", str(tmp_path / "system-runtime" / "mac_audit_agent" / "monitor.py"), "--run"]
+    assert "ProcessType" not in payload
+    assert payload["WorkingDirectory"] == str(tmp_path / "system-runtime")
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LAUNCH_SCOPE"] == "system"
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_RUNTIME_ROOT"] == str(tmp_path / "system-runtime")
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_LOG_ROOT"] == str(tmp_path / "system-logs")
+    assert payload["EnvironmentVariables"]["MAC_AUDIT_AGENT_DB_PATH"] == str(tmp_path / "system.sqlite3")
+    assert payload["StandardOutPath"].startswith(str(tmp_path / "system-logs"))
+    assert payload["StandardErrorPath"].startswith(str(tmp_path / "system-logs"))
+    assert launchctl_target("system") == "system"
+    assert default_monitor_db_path("system") == tmp_path / "system.sqlite3"
+    assert monitor_log_root("system") == tmp_path / "system-logs"
 
 
 def test_launch_agent_install_validates_with_plutil_and_sets_permissions(tmp_path: Path, monkeypatch) -> None:
@@ -451,6 +487,34 @@ def test_notification_manager_notifies_allowlisted_critical_events_by_default_an
     assert manager.should_notify(repeat) is False
 
 
+def test_cfaa_acknowledgment_runs_once_per_gui_session_and_records_acceptance(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    popen_calls = []
+    process = FakePopenProcess()
+
+    def runner(command, **kwargs):
+        assert command == ["/bin/launchctl", "print", f"gui/{os.getuid()}"]
+        return FakeCompletedProcess(returncode=0, stdout="uid = 501\nasid = 100003\n")
+
+    manager = NotificationManager(
+        db,
+        runner=runner,
+        popen_factory=lambda command, **kwargs: popen_calls.append((command, kwargs)) or process,
+    )
+    assert manager.start_cfaa_login_acknowledgment() is True
+    assert manager.start_cfaa_login_acknowledgment() is False
+    assert len(popen_calls) == 1
+    assert "18 U.S.C. 1030" in popen_calls[0][0][2]
+    assert db.get_background_monitor_state("cfaa_acknowledgment_status") == "pending for gui/501:asid/100003"
+
+    process.returncode = 0
+    assert manager.poll_cfaa_login_acknowledgment() is True
+    assert db.get_background_monitor_state("cfaa_acknowledged_session") == "gui/501:asid/100003"
+    assert db.get_background_monitor_state("cfaa_acknowledged_at")
+    assert manager.start_cfaa_login_acknowledgment() is False
+    assert len(popen_calls) == 1
+
+
 def test_high_priority_event_uses_configured_alert_style(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     calls = []
@@ -505,6 +569,47 @@ def test_low_event_logs_but_does_not_popup_by_default(tmp_path: Path) -> None:
     )
     assert manager.should_notify(event) is False
     assert event.notification_decision == "log_only"
+
+
+def test_input_activity_resumed_after_idle_notifies_by_default(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="input-idle-1",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="input_activity_resumed_after_idle",
+        severity="medium",
+        source="hid_idle_time",
+        evidence="Keyboard, mouse, and trackpad were idle for at least 120 seconds before input resumed.",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+    )
+    assert manager.preference_for(event.event_type)["severity"] == "medium"
+    assert manager.preference_for(event.event_type)["notification_mode"] == "dialog"
+    assert manager.should_notify(event) is True
+
+
+def test_input_activity_resumed_after_idle_uses_cfaa_dialog(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    calls = []
+    manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
+    event = BackgroundMonitorEvent(
+        event_id="input-idle-dialog",
+        timestamp="2026-04-24T12:00:00+00:00",
+        event_type="input_activity_resumed_after_idle",
+        severity="medium",
+        source="hid_idle_time",
+        evidence="Keyboard, mouse, and trackpad were idle for at least 120 seconds before input resumed.",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+    )
+    sent, error = manager.notify(event)
+    assert sent is True
+    assert error == ""
+    assert any("display dialog" in command[2] for command in calls)
+    assert any("Authorized use reminder" in command[2] for command in calls)
 
 
 def test_medium_event_logs_but_does_not_popup_by_default(tmp_path: Path) -> None:
@@ -657,7 +762,7 @@ def test_launchdaemon_added_pops_by_default(tmp_path: Path) -> None:
     assert event.popup_allowed is True
 
 
-def test_non_allowlisted_events_never_popup_by_default(tmp_path: Path) -> None:
+def test_usb_events_send_a_non_modal_recognition_notification_by_default(tmp_path: Path) -> None:
     db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
     manager = NotificationManager(db)
     event = BackgroundMonitorEvent(
@@ -671,8 +776,555 @@ def test_non_allowlisted_events_never_popup_by_default(tmp_path: Path) -> None:
         recommendation="review",
         metadata_json="{}",
     )
-    assert manager.should_notify(event) is False
-    assert event.notification_reason == "event type is log-only by default"
+    assert manager.should_notify(event) is True
+    assert event.notification_reason == "first_severe_event"
+    assert manager.preference_for("usb_device_connected")["notification_mode"] == "notification"
+
+
+def test_hardware_monitor_baselines_usb_then_emits_new_recognition() -> None:
+    monitor = HardwareMonitor()
+    baseline = HardwareMonitorSnapshot(
+        usb_devices=[{"vendor_id": "1", "product_id": "2", "serial": "existing", "location_id": "3", "vendor": "Acme", "name": "Existing"}]
+    )
+    current = HardwareMonitorSnapshot(
+        usb_devices=[
+            {"vendor_id": "1", "product_id": "2", "serial": "existing", "location_id": "3", "vendor": "Acme", "name": "Existing"},
+            {"vendor_id": "4", "product_id": "5", "serial": "new", "location_id": "6", "vendor": "Acme", "name": "New Device"},
+        ]
+    )
+    assert monitor.evaluate(None, baseline) == []
+    events = monitor.evaluate(baseline, current)
+    assert [event.event_type for event in events] == ["usb_device_connected"]
+    assert "Acme New Device" in events[0].evidence
+
+
+def test_hardware_monitor_assigns_distinct_ids_to_usb_devices_in_same_snapshot() -> None:
+    monitor = HardwareMonitor()
+    events = monitor.usb_connection_events(
+        [],
+        [
+            {"vendor_id": "1", "product_id": "2", "serial": "first", "location_id": "3"},
+            {"vendor_id": "4", "product_id": "5", "serial": "second", "location_id": "6"},
+        ],
+        timestamp="2026-05-31T12:00:00+00:00",
+    )
+    assert len({event.event_id for event in events}) == 2
+
+
+def test_hardware_monitor_emits_only_explicit_new_moisture_markers() -> None:
+    monitor = HardwareMonitor()
+    baseline = HardwareMonitorSnapshot(moisture_markers={"USB-C status normal"})
+    current = HardwareMonitorSnapshot(moisture_markers={"USB-C status normal", "Liquid detected in USB-C port"})
+    events = monitor.evaluate(baseline, current)
+    assert [event.event_type for event in events] == ["system_moisture_detected"]
+    assert events[0].severity == "critical"
+
+
+def test_usb_reconnect_observer_enqueues_new_connection() -> None:
+    snapshots = [
+        [{"vendor_id": "1", "product_id": "2", "serial": "abc", "location_id": "3", "session_id": "old"}],
+        [],
+        [{"vendor_id": "1", "product_id": "2", "serial": "abc", "location_id": "3", "session_id": "new"}],
+    ]
+    monitor = HardwareMonitor()
+    last_snapshot = snapshots[-1]
+    monitor.collect_usb_devices = lambda: snapshots.pop(0) if snapshots else last_snapshot
+    observer = USBReconnectObserver(monitor, poll_seconds=0.01, quiet_window_seconds=0.01)
+    observer.start()
+    try:
+        import time
+        deadline = time.monotonic() + 1
+        events = []
+        while time.monotonic() < deadline and not events:
+            time.sleep(0.02)
+            events = observer.drain()
+    finally:
+        observer.stop()
+    assert [event.event_type for event in events] == ["usb_device_connected"]
+    assert '"session_id": "new"' in events[0].metadata_json
+
+
+def test_service_groups_usb_observer_burst_into_one_alert(tmp_path: Path) -> None:
+    hardware = HardwareMonitor()
+    events = hardware.usb_connection_events(
+        [],
+        [
+            {"vendor_id": "1", "product_id": "2", "serial": "first", "location_id": "3", "session_id": "old", "name": "Phone"},
+            {"vendor_id": "1", "product_id": "2", "serial": "first", "location_id": "3", "session_id": "new", "name": "Phone"},
+            {"vendor_id": "4", "product_id": "5", "serial": "second", "location_id": "6", "name": "Adapter"},
+        ],
+    )
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite")
+    grouped = service._coalesce_usb_observer_events(events)
+    assert len(grouped) == 1
+    assert grouped[0].event_type == "usb_device_connected"
+    assert "USB reconnect recognized 2 device(s)" in grouped[0].evidence
+    assert "connection=" not in grouped[0].evidence
+
+
+def test_service_alerts_critical_once_for_first_seen_usb_identity(tmp_path: Path) -> None:
+    hardware = HardwareMonitor()
+    trusted = {"vendor_id": "1", "product_id": "2", "serial": "trusted", "location_id": "3", "name": "Phone"}
+    new = {"vendor_id": "4", "product_id": "5", "serial": "new", "location_id": "6", "name": "Adapter"}
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite")
+    assert service._classify_usb_observer_events([], [trusted]) == []
+
+    events = hardware.usb_connection_events([], [new])
+    first_seen = service._classify_usb_observer_events(events, [trusted, new])
+    assert len(first_seen) == 1
+    assert first_seen[0].event_type == "new_usb_device_detected"
+    assert first_seen[0].severity == "critical"
+
+    reconnect = service._classify_usb_observer_events(events, [trusted, new])
+    assert len(reconnect) == 1
+    assert reconnect[0].event_type == "usb_device_connected"
+    assert reconnect[0].severity == "info"
+
+
+def test_usb_and_moisture_events_use_distinct_sounds(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    usb = BackgroundMonitorEvent(
+        event_id="usb-sound",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="info",
+        source="hardware",
+        evidence="USB device recognized.",
+    )
+    moisture = BackgroundMonitorEvent(
+        event_id="moisture-sound",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="system_moisture_detected",
+        severity="critical",
+        source="hardware",
+        evidence="Liquid detected.",
+    )
+    assert manager._sound_for(usb, manager.settings()) == "Pop"
+    assert manager._sound_for(moisture, manager.settings()) == "Basso"
+
+
+def test_new_usb_device_uses_critical_alert_and_usb_sound(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="new-usb",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="new_usb_device_detected",
+        severity="critical",
+        source="hardware",
+        evidence="New USB device identity detected.",
+    )
+    preference = manager.preference_for(event.event_type)
+    assert preference["severity"] == "critical"
+    assert preference["notification_mode"] == "both"
+    assert manager._sound_for(event, manager.settings()) == "Pop"
+
+
+def test_network_monitor_detects_ip_assignment_and_vpn_connection() -> None:
+    monitor = NetworkMonitor()
+    previous = NetworkMonitorSnapshot(
+        interface="en0",
+        ip_address="192.168.1.10",
+        netmask="255.255.255.0",
+        gateway="192.168.1.1",
+        subnet="192.168.1.0/24",
+        scope="private",
+        vpn_interfaces=[],
+    )
+    current = NetworkMonitorSnapshot(
+        interface="en0",
+        ip_address="192.168.1.20",
+        netmask="255.255.255.0",
+        gateway="192.168.1.1",
+        subnet="192.168.1.0/24",
+        scope="private",
+        vpn_interfaces=[{"interface": "utun3", "ip_address": "10.8.0.12", "netmask": "255.255.255.255", "broadcast": ""}],
+    )
+    events = monitor.evaluate(previous, current)
+    assert [event.event_type for event in events] == ["network_ip_assigned", "vpn_connected"]
+    assert events[0].severity == "info"
+    assert "192.168.1.20" in events[0].evidence
+    assert events[1].severity == "info"
+    assert "utun3" in events[1].evidence
+
+
+def test_network_info_alert_uses_overlay_and_bypasses_min_severity(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    popen_calls = []
+    process = FakePopenProcess()
+    process.pid = 44556
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.os.kill", lambda pid, signal: None)
+    db.set_background_monitor_state("security_overlay_enabled", "1")
+    manager = NotificationManager(db, popen_factory=lambda command, **kwargs: popen_calls.append(command) or process)
+    manager.update_settings(
+        notify_all_events=False,
+        notify_important_events=True,
+        notify_min_severity="critical",
+        notification_sound="Glass",
+        duplicate_rate_limit_seconds=10,
+        high_priority_alert_style="notification",
+        notification_mode="notification",
+        popup_only_severe_events=True,
+        browser_capture_process_popup=False,
+    )
+    event = BackgroundMonitorEvent(
+        event_id="network-1",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="network_ip_assigned",
+        severity="info",
+        source="network_state_observer",
+        evidence="IP address assigned on en0: 192.168.1.20 (subnet 192.168.1.0/24, gateway 192.168.1.1). Detected at 2026-05-31T12:00:00+00:00.",
+        confidence="high",
+        recommendation="review",
+        metadata_json="{}",
+    )
+    assert manager.should_notify(event) is True
+    sent, error = manager.notify(event)
+    assert sent is True
+    assert error == ""
+    assert manager._sound_for(event, manager.settings()) == ""
+    assert json.loads(state_path.read_text(encoding="utf-8"))["severity"] == "info"
+    assert len(popen_calls) == 1
+
+
+def test_persistence_monitor_detects_new_launchdaemon_and_login_items(monkeypatch) -> None:
+    monitor = PersistenceMonitor()
+    previous = PersistenceSnapshot(
+        launch_items=[
+            type(
+                "LaunchItem",
+                (),
+                {
+                    "path": "/Library/LaunchDaemons/com.old.plist",
+                    "label": "com.old",
+                    "program": "/usr/bin/true",
+                    "program_arguments": ["/usr/bin/true"],
+                    "run_at_load": True,
+                    "keep_alive": False,
+                    "suspicious": False,
+                    "reasons": [],
+                    "to_dict": lambda self=None: {
+                        "path": "/Library/LaunchDaemons/com.old.plist",
+                        "label": "com.old",
+                        "program": "/usr/bin/true",
+                        "program_arguments": ["/usr/bin/true"],
+                        "run_at_load": True,
+                        "keep_alive": False,
+                        "suspicious": False,
+                        "reasons": [],
+                    },
+                },
+            )()
+        ],
+        login_items=["Finder"],
+    )
+    current = PersistenceSnapshot(
+        launch_items=[
+            previous.launch_items[0],
+            type(
+                "LaunchItem",
+                (),
+                {
+                    "path": "/Library/LaunchDaemons/com.new.plist",
+                    "label": "com.new",
+                    "program": "/usr/bin/true",
+                    "program_arguments": ["/usr/bin/true"],
+                    "run_at_load": True,
+                    "keep_alive": False,
+                    "suspicious": False,
+                    "reasons": [],
+                    "to_dict": lambda self=None: {
+                        "path": "/Library/LaunchDaemons/com.new.plist",
+                        "label": "com.new",
+                        "program": "/usr/bin/true",
+                        "program_arguments": ["/usr/bin/true"],
+                        "run_at_load": True,
+                        "keep_alive": False,
+                        "suspicious": False,
+                        "reasons": [],
+                    },
+                },
+            )()
+        ],
+        login_items=["Finder", "NewLoginItem"],
+    )
+    events = monitor.evaluate(previous, current)
+    assert [event.event_type for event in events] == ["launchdaemon_added", "persistence_item_created_high_risk"]
+    assert events[0].severity == "critical"
+    assert "com.new.plist" in events[0].evidence
+    assert events[1].severity == "critical"
+    assert "NewLoginItem" in events[1].evidence
+
+
+def test_persistence_detector_logs_previous_and_current_inventory(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite")
+    log_lines = []
+    current = PersistenceSnapshot(
+        launch_items=[],
+        login_items=[],
+    )
+    service.persistence_monitor.collect_snapshot = lambda: current  # type: ignore[assignment]
+    monkeypatch.setattr(service, "_write_log_line", lambda message: log_lines.append(message))
+    first = service._run_persistence_detector()
+    assert first == []
+    assert any("persistence baseline established" in line for line in log_lines)
+    assert any("persistence inventory previous" in line for line in log_lines)
+    assert any("persistence inventory current" in line for line in log_lines)
+
+
+def test_workflow_layer_replay_review_and_explainability(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    workflow = InvestigatorWorkflowLayer(db)
+    first_scan = ScanResult(
+        scan_id="scan-1",
+        timestamp="2026-05-31T12:00:00+00:00",
+        hostname="host",
+        current_user="user",
+        findings=[
+            Finding(
+                id="finding-1",
+                category="Persistence",
+                title="Suspicious Launch Item",
+                severity="high",
+                description="A LaunchDaemon references a writable path.",
+                evidence="/Library/LaunchDaemons/com.bad.plist -> /tmp/run.sh",
+                command_used="local plist parsing",
+                remediation_suggestion="Review the plist owner and referenced binary.",
+                warning="Can restart unwanted software automatically.",
+                evidence_summary="/Library/LaunchDaemons/com.bad.plist -> /tmp/run.sh",
+                why_this_matters="Launch items provide persistence.",
+                recommended_next_steps="Review the plist owner and referenced binary.",
+            )
+        ],
+    )
+    second_scan = ScanResult(
+        scan_id="scan-2",
+        timestamp="2026-05-31T12:05:00+00:00",
+        hostname="host",
+        current_user="user",
+        findings=first_scan.findings,
+    )
+    db.record_scan(ScanSummary("scan-1", "2026-05-31T12:00:00+00:00", "2026-05-31T12:00:30+00:00", 1, 88, "first", 0, "Good"))
+    db.record_scan_result(first_scan)
+    db.record_finding("scan-1", first_scan.findings[0])
+    db.record_scan(ScanSummary("scan-2", "2026-05-31T12:05:00+00:00", "2026-05-31T12:05:30+00:00", 1, 84, "second", 1, "Needs Review"))
+    db.record_scan_result(second_scan)
+    db.record_finding("scan-2", second_scan.findings[0])
+    replay = workflow.build_security_replay(limit=10, focus_scan_id="scan-2")
+    assert any(moment.scan_id == "scan-2" for moment in replay)
+    queue = workflow.build_review_queue(scan_id="scan-2")
+    assert queue[0].title == "Suspicious Launch Item"
+    explanation = workflow.explain_finding(second_scan.findings[0], scan=second_scan)
+    assert explanation["what_happened"] == "A LaunchDaemon references a writable path."
+    assert explanation["supporting_evidence"]
+    assert explanation["next_action"]
+
+
+def test_workflow_layer_context_window_includes_surrounding_activity(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    workflow = InvestigatorWorkflowLayer(db)
+    anchor = datetime.now(timezone.utc)
+    scan_timestamp = (anchor - timedelta(minutes=5)).isoformat()
+    event_timestamp = (anchor + timedelta(minutes=10)).isoformat()
+    scan = ScanResult(
+        scan_id="scan-context",
+        timestamp=scan_timestamp,
+        hostname="host",
+        current_user="user",
+        findings=[
+            Finding(
+                id="finding-context",
+                category="Persistence",
+                title="Context Finding",
+                severity="medium",
+                description="A launch item exists.",
+                evidence="/Library/LaunchAgents/com.example.agent.plist",
+                command_used="local plist parsing",
+                remediation_suggestion="Review the plist.",
+                warning="Could be legitimate.",
+                evidence_summary="/Library/LaunchAgents/com.example.agent.plist",
+                why_this_matters="Launch items can provide persistence.",
+                recommended_next_steps="Review the plist.",
+            )
+        ],
+    )
+    db.record_scan(ScanSummary("scan-context", scan_timestamp, scan_timestamp, 1, 90, "context", 0, "Good"))
+    db.record_scan_result(scan)
+    db.record_finding("scan-context", scan.findings[0])
+    db.record_monitor_event(
+        BackgroundMonitorEvent(
+            event_id="network-context",
+            timestamp=event_timestamp,
+            event_type="network_ip_assigned",
+            severity="info",
+            source="network_state_observer",
+            evidence="IP address assigned on en0: 192.168.1.25.",
+            confidence="high",
+            recommendation="Confirm the new network connection is expected.",
+            metadata_json="{}",
+        )
+    )
+    db.set_review_status(
+        item_type="finding",
+        item_key="finding-context",
+        label="Context Finding",
+        review_state="reviewed",
+        linked_scan_id="scan-context",
+        linked_finding_id="finding-context",
+    )
+    window = workflow.build_context_window(
+        anchor.isoformat(),
+        focus_label="Context Finding",
+        focus_kind="finding",
+        focus_category="Persistence",
+        focus_id="finding-context",
+        focus_scan_id="scan-context",
+    )
+    assert window.window_start == (anchor - timedelta(minutes=15)).isoformat()
+    assert window.window_end == (anchor + timedelta(minutes=15)).isoformat()
+    assert any(moment.focus for moment in window.moments)
+    assert any(moment.category == "scan" for moment in window.moments)
+    assert any(moment.category == "network" for moment in window.moments)
+    assert any(moment.category == "admin" for moment in window.moments)
+    assert any("LaunchAgents" in " ".join(moment.evidence) for moment in window.moments if moment.evidence)
+
+
+def test_workflow_layer_learns_benign_suppressions(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    workflow = InvestigatorWorkflowLayer(db)
+    scan = ScanResult(
+        scan_id="scan-benign",
+        timestamp="2026-05-31T12:10:00+00:00",
+        hostname="host",
+        current_user="user",
+        findings=[
+            Finding(
+                id="finding-benign",
+                category="Persistence",
+                title="Benign Launch Item",
+                severity="medium",
+                description="A LaunchAgent is present.",
+                evidence="/Library/LaunchAgents/com.example.agent.plist",
+                command_used="local plist parsing",
+                remediation_suggestion="Review the plist.",
+                warning="Could be legitimate.",
+                evidence_summary="/Library/LaunchAgents/com.example.agent.plist",
+                why_this_matters="Launch items can provide persistence.",
+                recommended_next_steps="Review the plist.",
+            )
+        ],
+    )
+    db.record_scan(ScanSummary("scan-benign", "2026-05-31T12:10:00+00:00", "2026-05-31T12:10:30+00:00", 1, 90, "benign", 0, "Good"))
+    db.record_scan_result(scan)
+    db.record_finding("scan-benign", scan.findings[0])
+    workflow.mark_benign("scan-benign", "finding-benign", notes="Expected management agent.")
+    suppression = db.find_suppression_rule(scan.findings[0])
+    assert suppression is not None
+    assert suppression.active is True
+    assert suppression.review_state == "false positive"
+
+
+def test_security_overlay_groups_critical_events_and_launches_one_process(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    popen_calls = []
+    process = FakePopenProcess()
+    process.pid = 98765
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.os.kill", lambda pid, signal: None)
+    db.set_background_monitor_state("security_overlay_enabled", "1")
+    manager = NotificationManager(db, popen_factory=lambda command, **kwargs: popen_calls.append(command) or process)
+    event = BackgroundMonitorEvent(
+        event_id="overlay-1",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="system_moisture_detected",
+        severity="critical",
+        source="hardware",
+        evidence="Liquid detected in USB-C port.",
+    )
+    assert manager.update_security_overlay(event) is True
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 1
+    assert len(popen_calls) == 1
+
+    repeat = BackgroundMonitorEvent(**{**event.to_dict(), "event_id": "overlay-2", "timestamp": "2026-05-31T12:01:00+00:00"})
+    assert manager.update_security_overlay(repeat) is True
+    assert json.loads(state_path.read_text(encoding="utf-8"))["count"] == 2
+    assert len(popen_calls) == 1
+
+
+def test_security_overlay_ignores_low_severity_events(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    state_path = tmp_path / "state" / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    db.set_background_monitor_state("security_overlay_enabled", "1")
+    manager = NotificationManager(db)
+    event = BackgroundMonitorEvent(
+        event_id="overlay-low",
+        timestamp="2026-05-31T12:00:00+00:00",
+        event_type="usb_device_connected",
+        severity="low",
+        source="hardware",
+        evidence="USB recognized.",
+    )
+    assert manager.update_security_overlay(event) is False
+    assert not state_path.exists()
+
+
+def test_security_overlay_reconciliation_relaunches_active_overlay(tmp_path: Path, monkeypatch) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    state_path = tmp_path / "state" / "security_overlay.json"
+    pid_path = tmp_path / "state" / "security_overlay.pid"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"active": True, "event_type": "system_moisture_detected"}), encoding="utf-8")
+    popen_calls = []
+    process = FakePopenProcess()
+    process.pid = 12345
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", pid_path)
+    db.set_background_monitor_state("security_overlay_enabled", "1")
+    manager = NotificationManager(db, popen_factory=lambda command, **kwargs: popen_calls.append(command) or process)
+    assert manager.reconcile_security_overlay() is True
+    assert len(popen_calls) == 1
+    assert db.get_background_monitor_state("security_overlay_status") == "active: system_moisture_detected"
+
+
+def test_duplicate_critical_event_updates_overlay_counter_even_when_db_dedupes(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite")
+    overlay_calls = []
+    monkeypatch.setattr(service.notifications, "should_notify", lambda _event: False)
+    monkeypatch.setattr(service.notifications, "update_security_overlay", lambda event: overlay_calls.append(event.event_type) or True)
+    first = service._build_event(
+        "system_moisture_detected",
+        "Liquid detected in USB-C port.",
+        severity="critical",
+        confidence="high",
+        source="hardware",
+    )
+    second = BackgroundMonitorEvent(**{**first.to_dict(), "event_id": "moisture-repeat"})
+    assert service.record_monitor_event(first) == first.event_id
+    assert service.record_monitor_event(second) is None
+    assert overlay_calls == ["system_moisture_detected"]
+
+
+def test_cfaa_findings_digest_groups_findings_and_suppresses_unchanged_repeat(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    calls = []
+    manager = NotificationManager(db, runner=lambda *args, **kwargs: calls.append(args[0]) or FakeCompletedProcess(returncode=0))
+    findings = [
+        {"severity": "high", "title": "CVE finding", "cve_ids": ["CVE-2026-0001"]},
+        {"severity": "info", "title": "Informational finding", "cve_ids": ["CVE-2026-0002"]},
+    ]
+    assert manager.notify_findings_digest(findings) == (True, "")
+    assert manager.notify_findings_digest(findings) == (False, "unchanged findings digest")
+    assert len(calls) == 1
+    assert "18 U.S.C. 1030" in calls[0][2]
 
 
 def test_applescript_escape_prevents_broken_strings() -> None:
@@ -1100,6 +1752,38 @@ def test_pmset_clamshell_sleep_and_lidopen_markers_create_lid_events() -> None:
     assert any(marker.startswith("possible_lid_opened|") for marker in markers)
 
 
+def test_input_activity_resumed_after_idle_creates_medium_event() -> None:
+    monitor = SessionMonitor(executor=lambda _command: (1, "", "unsupported"))
+    previous = SessionSnapshot(hid_idle_seconds=305.0)
+    current = SessionSnapshot(hid_idle_seconds=1.0)
+    events = monitor.evaluate(previous, current)
+    assert any(event.event_type == "input_activity_resumed_after_idle" for event in events)
+    event = next(event for event in events if event.event_type == "input_activity_resumed_after_idle")
+    assert event.severity == "medium"
+    assert "idle for at least 120 seconds" in event.evidence
+
+
+def test_session_state_observer_enqueues_lid_events_quickly() -> None:
+    snapshots = [
+        SessionSnapshot(display_state="awake", system_power_state="awake", session_locked=False, console_user="m", clamshell_state="open"),
+        SessionSnapshot(display_state="awake", system_power_state="awake", session_locked=False, console_user="m", clamshell_state="closed"),
+    ]
+    monitor = SessionMonitor(executor=lambda _command: (1, "", "unsupported"))
+    monitor.collect_snapshot = lambda: snapshots.pop(0) if snapshots else SessionSnapshot(display_state="awake", system_power_state="awake", session_locked=False, console_user="m", clamshell_state="closed")
+    observer = SessionStateObserver(monitor, poll_seconds=0.01)
+    observer.start()
+    try:
+        import time
+        deadline = time.monotonic() + 1
+        events = []
+        while time.monotonic() < deadline and not events:
+            time.sleep(0.02)
+            events = observer.drain()
+    finally:
+        observer.stop()
+    assert any(event.event_type == "possible_lid_closed" for event in events)
+
+
 def test_console_user_change_creates_session_transition_event() -> None:
     monitor = SessionMonitor(executor=lambda _command: (1, "", "unsupported"))
     previous = monitor.collect_snapshot()
@@ -1185,6 +1869,29 @@ def test_background_monitor_panel_handles_running_and_stopped_states(tmp_path: P
     with patch("mac_audit_agent.ui.background_monitor_panel.is_pid_alive", return_value=True):
         panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=True))
         assert "running" in panel.status_label.text()
+    assert app is not None
+
+
+def test_background_monitor_panel_show_context_button_enables_for_selected_event(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    event = BackgroundMonitorEvent(
+        event_id="event-context",
+        timestamp="2026-05-31T12:10:00+00:00",
+        event_type="vpn_connected",
+        severity="info",
+        source="network_state_observer",
+        evidence="VPN connection assigned: utun3 10.0.0.2.",
+        confidence="high",
+        recommendation="Confirm the VPN connection is expected.",
+        metadata_json="{}",
+    )
+    db.record_monitor_event(event)
+    panel = BackgroundMonitorPanel(db, FakeLaunchAgent(installed=True, running=False))
+    panel.refresh_events()
+    panel.events_table.selectRow(0)
+    assert panel.show_context_button.text() == "Show Context"
+    assert panel.show_context_button.isEnabled()
     assert app is not None
 
 
@@ -1718,6 +2425,10 @@ def test_run_forever_calls_detector_loop_repeatedly(tmp_path: Path, monkeypatch)
         return []
 
     monkeypatch.setattr(service, "run_once", fake_run_once)
+    monkeypatch.setattr(service.notifications, "start_cfaa_login_acknowledgment", lambda: False)
+    monkeypatch.setattr(service.notifications, "poll_cfaa_login_acknowledgment", lambda: False)
+    monkeypatch.setattr(service.notifications, "reconcile_security_overlay", lambda: False)
+    monkeypatch.setattr(service.usb_observer, "start", lambda: None)
     monkeypatch.setattr("mac_audit_agent.monitor.time.sleep", lambda _seconds: None)
 
     try:
@@ -2083,3 +2794,78 @@ def test_report_includes_background_monitor_events_only_when_selected(tmp_path: 
     assert "Background Monitor Events" not in html_path.read_text(encoding="utf-8")
     html_with_events = export_scan_result_html(scan_result, tmp_path / "report_with_events.html", include_background_monitor_logs=True, background_monitor_events=events)
     assert "Background Monitor Events" in html_with_events.read_text(encoding="utf-8")
+
+
+def test_missing_rule_id_blocks_popup(tmp_path: Path) -> None:
+    db = AuditDatabase(tmp_path / "audit.sqlite", tmp_path / "logs")
+    manager = NotificationManager(db, runner=lambda *args, **kwargs: FakeCompletedProcess(returncode=0, stdout="", stderr=""))
+    event = BackgroundMonitorEvent(
+        event_id="event-1",
+        timestamp="2026-06-01T12:00:00+00:00",
+        event_type="legacy_event",
+        severity="info",
+        source="session_poll",
+        evidence="Display woke.",
+        confidence="high",
+        recommendation="Review the event.",
+    )
+    decision = manager.evaluate_notification_decision(event)
+    assert decision["decision"] == "invalid_incomplete"
+    assert decision["reason"] == "missing_rule_id"
+    popup, reason = manager.should_popup(event)
+    assert popup is False
+    assert reason == "missing rule_id"
+
+
+def test_background_monitor_event_round_trips_provenance(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", record_startup=False)
+    monkeypatch.setattr(service.notifications, "should_notify", lambda event, force=False: False)
+    event = service._build_event(
+        "screen_wake",
+        "Display woke.",
+        severity="info",
+        confidence="high",
+        source="session_poll",
+        trigger_subsource="display_power",
+        previous_state="sleep",
+        current_state="awake",
+    )
+    assert service.record_monitor_event(event) == event.event_id
+    saved = service.db.latest_monitor_events(limit=1)[0]
+    assert saved.rule_id
+    assert saved.trigger_source == "session_poll"
+    assert saved.previous_state == "sleep"
+    assert saved.current_state == "awake"
+    assert "Detector=" in saved.source_trace
+
+
+def test_alert_storm_groups_repeated_events(tmp_path: Path, monkeypatch) -> None:
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", record_startup=False)
+    monkeypatch.setattr(service.notifications, "notify", lambda event, force=False: (True, ""))
+    monkeypatch.setattr(service.notifications, "should_notify", lambda event, force=False: True)
+    base_timestamp = "2026-06-01T12:00:00+00:00"
+    for index in range(21):
+        event = service._build_event(
+            "suspicious_process_observed",
+            f"Browser process burst {index}",
+            severity="high",
+            confidence="medium",
+            source="browser_detector",
+            process_name="Opera Helper",
+            related_path="/Applications/Opera.app/Contents/MacOS/Opera Helper",
+            trigger_subsource="browser_process_args",
+            previous_state="single process",
+            current_state="repeated process observation",
+        )
+        event.timestamp = base_timestamp
+        event.event_id = f"storm-{index}"
+        service.record_monitor_event(event)
+    events = service.db.latest_monitor_events(limit=5)
+    assert any(item.event_type == "alert_storm_detected" for item in events)
+
+
+def test_provenance_text_redacts_secrets() -> None:
+    text = sanitize_signal_text("token=abc123 Authorization=Bearer super-secret cookie=sessionid")
+    assert "abc123" not in text
+    assert "super-secret" not in text
+    assert "[redacted]" in text

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mac_audit_agent.assets import get_asset_data_uri
+from mac_audit_agent.cve_radar import group_forecast_cards_for_display
+from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
 from mac_audit_agent.models import BaselineComparison, Finding, ScanResult, ScanSummary
 from mac_audit_agent.storage import json_safe
 
@@ -103,6 +105,10 @@ def score_from_findings(findings: list[Finding]) -> tuple[int | None, str]:
     return score, "High Risk"
 
 
+def execution_evidence_from_scan(scan_result: ScanResult) -> list[dict]:
+    return [item.to_dict() for item in ExecutionEvidenceEngine().analyze_scan(scan_result)]
+
+
 def export_json_report(
     summary: ScanSummary,
     findings: list[Finding],
@@ -183,14 +189,14 @@ def export_investigation_notes_html(
 def export_monitor_events_html(events: list[dict], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rows = "".join(
-        f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('event_type', '')))}</td><td>{html.escape(str(item.get('severity', '')))}</td><td>{html.escape(str(item.get('source', '')))}</td><td>{html.escape(str(item.get('process_name', '')))}</td><td>{html.escape(str(item.get('confidence', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td></tr>"
+        f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('event_type', '')))}</td><td>{html.escape(str(item.get('severity', '')))}</td><td>{html.escape(str(item.get('source', '')))}</td><td>{html.escape(str(item.get('rule_id', item.get('trigger_rule_id', ''))))}</td><td>{html.escape(str(item.get('trigger_source', '')))}</td><td>{html.escape(str(item.get('confidence', '')))}</td><td>{html.escape(str(item.get('previous_state', '')))}</td><td>{html.escape(str(item.get('current_state', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td></tr>"
         for item in events
     )
     logo_markup = report_logo_markup()
     output_path.write_text(
         (
             "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Background Monitor Events</title></head><body>"
-            f"{logo_markup}<h1>Background Monitor Events</h1><table border='1'><thead><tr><th>Timestamp</th><th>Type</th><th>Severity</th><th>Source</th><th>Process</th><th>Confidence</th><th>Evidence</th></tr></thead>"
+            f"{logo_markup}<h1>Background Monitor Events</h1><table border='1'><thead><tr><th>Timestamp</th><th>Type</th><th>Severity</th><th>Source</th><th>Rule ID</th><th>Trigger Source</th><th>Confidence</th><th>Previous State</th><th>Current State</th><th>Evidence</th></tr></thead>"
             f"<tbody>{rows}</tbody></table></body></html>"
         ),
         encoding="utf-8",
@@ -217,9 +223,12 @@ def export_scan_result_json(
     localhost_scan = payload.get("collected_artifacts", {}).get("localhost_scan", {})
     packet_captures = payload.get("collected_artifacts", {}).get("packet_captures", [])
     network_discovery = payload.get("collected_artifacts", {}).get("network_discovery", {})
+    apple_security_forecast = payload.get("collected_artifacts", {}).get("apple_security_forecast", payload.get("collected_artifacts", {}).get("cve_radar", {}))
+    execution_evidence = execution_evidence_from_scan(scan_result)
     score, score_label = score_from_findings(scan_result.findings)
     payload["security_score"] = score
     payload["score_label"] = score_label
+    payload["apple_security_forecast"] = apple_security_forecast
     payload["report_summary"] = {
         "security_score": score,
         "score_label": score_label,
@@ -235,7 +244,36 @@ def export_scan_result_json(
         "localhost_scan": localhost_scan,
         "packet_captures": packet_captures,
         "network_discovery": network_discovery,
+        "apple_security_forecast": apple_security_forecast,
+        "execution_evidence": execution_evidence,
+        "alert_storm_summaries": [
+            {
+                "timestamp": item.get("timestamp", ""),
+                "event_count": item.get("metadata", {}).get("event_count", item.get("evidence", "")),
+                "evidence": item.get("evidence", ""),
+                "correlation_id": item.get("correlation_id", ""),
+                "source_trace": item.get("source_trace", ""),
+            }
+            for item in payload.get("background_monitor_events", [])
+            if item.get("event_type") == "alert_storm_detected"
+        ],
         "packet_capture_privacy_warning": "Packet captures may contain sensitive traffic metadata or contents. Reports include only local metadata and file paths, not packet contents.",
+    }
+    if execution_evidence:
+        payload["report_summary"]["execution_evidence_count"] = len(execution_evidence)
+    payload["report_summary"]["apple_security_forecast_summary"] = {
+        "generated_at": apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", "")) if apple_security_forecast else "",
+        "level": apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "")) if apple_security_forecast else "clear",
+        "sources_used": apple_security_forecast.get("sources_used", []) if apple_security_forecast else [],
+        "cve_count": apple_security_forecast.get("cve_count", apple_security_forecast.get("cves_evaluated", 0)) if apple_security_forecast else 0,
+        "kev_count": apple_security_forecast.get("kev_count", apple_security_forecast.get("kev_matches", 0)) if apple_security_forecast else 0,
+        "cards": apple_security_forecast.get("display_cards", apple_security_forecast.get("cards", [])) if apple_security_forecast else [],
+        "simulated": bool(apple_security_forecast.get("simulated", False)) if apple_security_forecast else False,
+        "cache_age": apple_security_forecast.get("cache_age_text", "unknown") if apple_security_forecast else "unknown",
+        "apple_source_status": apple_security_forecast.get("apple_source_status", "") if apple_security_forecast else "",
+        "kev_source_status": apple_security_forecast.get("kev_source_status", "") if apple_security_forecast else "",
+        "epss_source_status": apple_security_forecast.get("epss_source_status", "") if apple_security_forecast else "",
+        "errors": apple_security_forecast.get("errors", []) if apple_security_forecast else [],
     }
     if include_background_monitor_logs:
         payload["background_monitor_events"] = background_monitor_events or []
@@ -403,6 +441,8 @@ def export_scan_result_html(
     localhost_scan = artifacts.get("localhost_scan", {})
     packet_captures = artifacts.get("packet_captures", [])
     network_discovery = artifacts.get("network_discovery", {})
+    apple_security_forecast = artifacts.get("apple_security_forecast", artifacts.get("cve_radar", {}))
+    execution_evidence = execution_evidence_from_scan(scan_result)
     score, score_label = score_from_findings(findings)
     severity_counts = summarize_findings_by_severity(findings)
     severity_cards = "".join(
@@ -440,6 +480,23 @@ def export_scan_result_html(
         """
         for finding in findings
     )
+    provenance_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(finding.get('title', '')))}</td>
+          <td>{html.escape(str(finding.get('rule_id', finding.get('trigger_rule_id', ''))))}</td>
+          <td>{html.escape(str(finding.get('trigger_source', '')))}</td>
+          <td>{html.escape(str(finding.get('trigger_subsource', '')))}</td>
+          <td>{html.escape(str(finding.get('confidence', '')))}</td>
+          <td>{html.escape(str(finding.get('previous_state', '')))}</td>
+          <td>{html.escape(str(finding.get('current_state', '')))}</td>
+          <td>{html.escape(str(finding.get('correlation_id', '')))}</td>
+          <td>{html.escape(', '.join(str(item) for item in finding.get('false_positive_hints', [])) or str(finding.get('false_positive_notes', '')))}</td>
+          <td>{html.escape(', '.join(str(item) for item in finding.get('recommended_verification_steps', [])) or ', '.join(str(item) for item in finding.get('verification_steps', [])))}</td>
+        </tr>
+        """
+        for finding in findings
+    ) or '<tr><td colspan="10">No provenance data recorded.</td></tr>'
     ports_rows = "".join(
         f"""
         <tr>
@@ -566,6 +623,45 @@ def export_scan_result_html(
         """
         for item in network_devices
     ) or '<tr><td colspan="11">No devices discovered. Check WiFi interface, subnet detection, and permissions.</td></tr>'
+    forecast_cards = apple_security_forecast.get("display_cards", [])
+    if not forecast_cards and apple_security_forecast.get("cards"):
+        forecast_cards = group_forecast_cards_for_display(apple_security_forecast.get("cards", []))
+    forecast_summary_rows = "".join(
+        f"<tr><td>{html.escape(str(label))}</td><td>{html.escape(str(value))}</td></tr>"
+        for label, value in [
+            ("Forecast Updated", str(apple_security_forecast.get("generated_at", apple_security_forecast.get("timestamp", ""))) or "not run"),
+            ("Forecast Level", str(apple_security_forecast.get("level", apple_security_forecast.get("forecast_level", "clear")))),
+            ("Sources Used", ", ".join(str(item) for item in apple_security_forecast.get("sources_used", [])) or "none"),
+            ("CVEs Evaluated", str(apple_security_forecast.get("cve_count", apple_security_forecast.get("cves_evaluated", 0)))),
+            ("Applicable Cards", str(len(forecast_cards))),
+            ("KEV Matches", str(apple_security_forecast.get("kev_count", apple_security_forecast.get("kev_matches", 0)))),
+            ("Apple Updates Available", "yes" if apple_security_forecast.get("level") in {"elevated", "urgent"} or apple_security_forecast.get("apple_updates_available") else "no"),
+            ("Cache Age", str(apple_security_forecast.get("cache_age_text", apple_security_forecast.get("cache_age", "unknown")))),
+            ("Apple Source Status", str(apple_security_forecast.get("apple_source_status", "unknown")) or "unknown"),
+            ("KEV Source Status", str(apple_security_forecast.get("kev_source_status", "unknown")) or "unknown"),
+            ("EPSS Source Status", str(apple_security_forecast.get("epss_source_status", "unknown")) or "unknown"),
+            ("Simulated", "yes" if apple_security_forecast.get("simulated") else "no"),
+        ]
+    )
+    if not apple_security_forecast or not forecast_cards:
+        forecast_summary_rows += '<tr><td colspan="2">Apple Security Forecast: no applicable cards at report time.</td></tr>'
+    forecast_rows = "".join(
+        f"""
+        <tr class="{severity_css_class(str(card.get('severity', 'info')))}">
+          <td>{html.escape(str(card.get('title', card.get('cve_id', ''))))}</td>
+          <td>{html.escape(', '.join(str(item) for item in card.get('cve_ids', card.get('cves', []))) or str(card.get('cve_id', '')))}</td>
+          <td>{html.escape(str(card.get('source', '')))}</td>
+          <td>{html.escape(str(card.get('forecast_level', card.get('severity', ''))))}</td>
+          <td>{html.escape(str(card.get('applicability_confidence', card.get('confidence', ''))))}</td>
+          <td>{html.escape('yes' if card.get('kev') or card.get('kev_cves') else 'no')}</td>
+          <td>{html.escape('yes' if card.get('apple_related') or card.get('source') == 'apple' else 'no')}</td>
+          <td>{html.escape(str(card.get('recommended_action', card.get('what_to_do', ''))))}</td>
+          <td>{html.escape(str(card.get('status', '')))}</td>
+          <td>{html.escape(str(card.get('why_shown_to_you', card.get('why_shown', card.get('why_it_matters', '')))))} </td>
+        </tr>
+        """
+        for card in forecast_cards
+    ) or '<tr><td colspan="10">Apple Security Forecast: no applicable cards at report time.</td></tr>'
     network_change_rows = "".join(
         f"<tr><td>{html.escape(str(change_type).replace('_', ' ').title())}</td><td>{html.escape(json.dumps(item, sort_keys=True))}</td></tr>"
         for change_type, items in network_discovery.get("comparison", {}).items()
@@ -583,6 +679,26 @@ def export_scan_result_html(
         for finding in findings
         if finding.get("category") == "Network Discovery"
     ) or '<tr><td colspan="3">No suspicious devices identified.</td></tr>'
+    execution_evidence_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(str(item.get('confidence', 'low')).title())}</td>
+          <td>{html.escape(str(item.get('title', '')))}</td>
+          <td>{html.escape(" | ".join(
+              f"{step.get('timestamp', '')} {step.get('event', '')}: {step.get('details', '')}".strip()
+              for step in item.get('timeline', [])
+          ))}</td>
+          <td>{html.escape(str(item.get('explanation', '')))}</td>
+          <td>{html.escape(", ".join(str(step) for step in item.get('next_steps', [])))}</td>
+        </tr>
+        """
+        for item in execution_evidence
+    ) or '<tr><td colspan="5">No execution evidence detected.</td></tr>'
+    storm_events = [item for item in background_monitor_events if item.get("event_type") == "alert_storm_detected"]
+    storm_rows = "".join(
+        f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td><td>{html.escape(str(item.get('correlation_id', '')))}</td><td>{html.escape(str(item.get('source_trace', '')))}</td></tr>"
+        for item in storm_events
+    ) or '<tr><td colspan="4">No alert storms recorded.</td></tr>'
     logo_markup = report_logo_markup()
     document = f"""<!DOCTYPE html>
 <html lang="en">
@@ -619,6 +735,7 @@ def export_scan_result_html(
     <p>Current User: {html.escape(scan_result.current_user)}</p>
     <p>Security Score: {html.escape('unavailable' if score is None else f'{score}/100')} &mdash; {html.escape(score_label)}</p>
     <p>Higher is better. This score is based on findings severity, not proof of compromise.</p>
+    <p>Execution evidence detection is local-only and evidence-based. It does not infer compromise.</p>
   </div>
   <div class="card">
     <h2>Severity Summary</h2>
@@ -633,6 +750,22 @@ def export_scan_result_html(
     <table>
       <thead><tr><th>Severity</th><th>Category</th><th>Title</th><th>Description</th><th>Evidence</th><th>Command/Source</th><th>Recommendations</th><th>What Can Go Wrong</th></tr></thead>
       <tbody>{findings_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Alert Provenance</h2>
+    <p>Each alert below includes the rule, detector, before/after state, correlation, false-positive hints, and verification steps.</p>
+    <table>
+      <thead><tr><th>Finding</th><th>Rule ID</th><th>Detector</th><th>Subsource</th><th>Confidence</th><th>Previous State</th><th>Current State</th><th>Correlation</th><th>False Positive Hints</th><th>Verification Steps</th></tr></thead>
+      <tbody>{provenance_rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>Execution Evidence</h2>
+    <p>Unexpected execution activity observed. Review recommended.</p>
+    <table>
+      <thead><tr><th>Confidence</th><th>Evidence</th><th>Timeline</th><th>Explanation</th><th>Recommended Actions</th></tr></thead>
+      <tbody>{execution_evidence_rows}</tbody>
     </table>
   </div>
   <div class="card">
@@ -718,12 +851,36 @@ def export_scan_result_html(
     <h2>History Indicators</h2>
     <table><thead><tr><th>Shell</th><th>Pattern</th><th>Matches</th><th>Redacted Evidence</th></tr></thead><tbody>{history_rows}</tbody></table>
   </div>
+  <div class="card">
+    <h2>Apple Security Forecast</h2>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{forecast_summary_rows}</tbody>
+    </table>
+    <table>
+      <thead>
+        <tr>
+          <th>Card</th>
+          <th>CVE IDs</th>
+          <th>Source</th>
+          <th>Forecast Level</th>
+          <th>Applicability</th>
+          <th>KEV</th>
+          <th>Apple</th>
+          <th>What to do now</th>
+          <th>Status</th>
+          <th>Why shown</th>
+        </tr>
+      </thead>
+      <tbody>{forecast_rows}</tbody>
+    </table>
+  </div>
 </body>
 </html>
 """
     if include_background_monitor_logs:
         event_rows = "".join(
-            f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('event_type', '')))}</td><td>{html.escape(str(item.get('severity', '')))}</td><td>{html.escape(str(item.get('source', '')))}</td><td>{html.escape(str(item.get('process_name', '')))}</td><td>{html.escape(str(item.get('confidence', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td></tr>"
+            f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('event_type', '')))}</td><td>{html.escape(str(item.get('severity', '')))}</td><td>{html.escape(str(item.get('source', '')))}</td><td>{html.escape(str(item.get('rule_id', item.get('trigger_rule_id', ''))))}</td><td>{html.escape(str(item.get('trigger_source', '')))}</td><td>{html.escape(str(item.get('correlation_id', '')))}</td><td>{html.escape(str(item.get('previous_state', '')))}</td><td>{html.escape(str(item.get('current_state', '')))}</td><td>{html.escape(str(item.get('confidence', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td></tr>"
             for item in background_monitor_events
         )
         document = document.replace(
@@ -731,8 +888,21 @@ def export_scan_result_html(
             (
                 "<div class='card'><h2>Background Monitor Events</h2><p>Optional local privacy and session indicators. "
                 "These logs do not contain camera images, audio, screen contents, keystrokes, or packet contents.</p>"
-                "<table><thead><tr><th>Timestamp</th><th>Type</th><th>Severity</th><th>Source</th><th>Process</th><th>Confidence</th><th>Evidence</th></tr></thead>"
+                "<table><thead><tr><th>Timestamp</th><th>Type</th><th>Severity</th><th>Source</th><th>Rule ID</th><th>Trigger Source</th><th>Correlation</th><th>Previous State</th><th>Current State</th><th>Confidence</th><th>Evidence</th></tr></thead>"
                 f"<tbody>{event_rows}</tbody></table></div></body>"
+            ),
+        )
+        storm_events = [item for item in background_monitor_events if item.get("event_type") == "alert_storm_detected"]
+        storm_rows = "".join(
+            f"<tr><td>{html.escape(str(item.get('timestamp', '')))}</td><td>{html.escape(str(item.get('evidence', '')))}</td><td>{html.escape(str(item.get('correlation_id', '')))}</td><td>{html.escape(str(item.get('source_trace', '')))}</td></tr>"
+            for item in storm_events
+        ) or '<tr><td colspan="4">No alert storms recorded.</td></tr>'
+        document = document.replace(
+            "</body>",
+            (
+                "<div class='card'><h2>Alert Storm Summary</h2>"
+                "<table><thead><tr><th>Timestamp</th><th>Evidence</th><th>Correlation</th><th>Source Trace</th></tr></thead>"
+                f"<tbody>{storm_rows}</tbody></table></div></body>"
             ),
         )
     if include_investigation_notes:

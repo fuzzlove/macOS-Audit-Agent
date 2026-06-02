@@ -23,21 +23,37 @@ import signal
 import traceback
 from datetime import datetime, timedelta, timezone
 
-from mac_audit_agent.launch_agent import LAUNCH_AGENT_LABEL, PLUTIL_BIN, default_launch_agent_paths, launchctl_target, monitor_script_path, project_root, runtime_monitor_script_path, runtime_root
+from mac_audit_agent.launch_agent import (
+    LAUNCH_AGENT_LABEL,
+    PLUTIL_BIN,
+    default_launch_agent_paths,
+    default_monitor_db_path,
+    launchctl_target,
+    monitor_log_root,
+    monitor_script_path,
+    project_root,
+    runtime_monitor_script_path,
+    runtime_root,
+)
+from mac_audit_agent.hardware_monitor import HardwareMonitor, USBReconnectObserver
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
+from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_event
+from mac_audit_agent.persistence_monitor import PersistenceMonitor, PersistenceSnapshot
+from mac_audit_agent.network_monitor import NetworkMonitor, NetworkStateObserver, NetworkMonitorSnapshot
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.privacy_monitor import PrivacyMonitor, PrivacyMonitorSnapshot
-from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot
+from mac_audit_agent.session_monitor import SessionMonitor, SessionSnapshot, SessionStateObserver
 from mac_audit_agent.storage import AuditDatabase
 
 
 LOGGER = logging.getLogger(__name__)
-MONITOR_VERSION = "background-monitor-2026.04.25"
+MONITOR_VERSION = "background-monitor-2026.05.31"
+TRUSTED_USB_DEVICES_STATE_KEY = "trusted_usb_devices_json"
 DISCLAIMER = (
     "This monitor records local security events and privacy indicators. "
     "It does not record camera, microphone, screen contents, keystrokes, or packet contents."
 )
-FALLBACK_MONITOR_LOG = Path.home() / "Library" / "Logs" / "MacAuditAgent" / "monitor.log"
+FALLBACK_MONITOR_LOG = monitor_log_root() / "monitor.log"
 STDOUT_MONITOR_LOG = default_launch_agent_paths().stdout_path
 STDERR_MONITOR_LOG = default_launch_agent_paths().stderr_path
 IMPORTANT_EVENT_TYPES = {
@@ -52,14 +68,22 @@ IMPORTANT_EVENT_TYPES = {
     "screen_sharing_enabled",
     "remote_login_enabled",
     "suspicious_process_observed",
+    "launchdaemon_added",
+    "launchagent_added",
+    "persistence_item_created_high_risk",
     "persistence_item_created",
     "major_security_event",
+    "alert_storm_detected",
     "monitor_self_test",
 }
+ALERT_STORM_THRESHOLD = 20
+ALERT_STORM_WINDOW_SECONDS = 300
 SUSPICIOUS_PROCESS_PREFIXES = ("/tmp", "/var/tmp", "/private/tmp", "/Users/Shared")
 SHARING_POLL_SECONDS = 15
 HEARTBEAT_SECONDS = 30
 DEDUPE_SECONDS = 60
+NETWORK_POLL_SECONDS = 2.0
+PERSISTENCE_POLL_SECONDS = 10.0
 PS_LINE_RE = re.compile(r"^\s*(\d+)\s+(.*?)\s{2,}(.*)$")
 
 
@@ -167,9 +191,18 @@ class BackgroundMonitorService:
         self.record_startup = record_startup
         self.privacy_monitor = PrivacyMonitor(executor=self.executor)
         self.session_monitor = SessionMonitor(executor=self.executor)
+        self.session_observer = SessionStateObserver(self.session_monitor)
+        self.hardware_monitor = HardwareMonitor(executor=self.executor)
+        self.usb_observer = USBReconnectObserver(self.hardware_monitor)
+        self.network_monitor = NetworkMonitor(executor=self.executor)
+        self.network_observer = NetworkStateObserver(self.network_monitor, poll_seconds=NETWORK_POLL_SECONDS)
+        self.persistence_monitor = PersistenceMonitor(executor=self.executor)
         self.notifications = NotificationManager(self.db)
         self.previous_privacy = None
         self.previous_session = None
+        self.previous_hardware = None
+        self.previous_network: NetworkMonitorSnapshot | None = None
+        self.previous_persistence: PersistenceSnapshot | None = None
         self.sharing_state: dict[str, bool | None] = {"remote_login": None, "screen_sharing": None, "file_sharing": None}
         self.latest_snapshot: dict[str, object] = {}
         self._last_heartbeat_written = 0.0
@@ -177,14 +210,20 @@ class BackgroundMonitorService:
         self.enabled_detectors = [
             "camera_process_detector",
             "screen_session_detector",
+            "network_state_detector",
+            "persistence_detector",
             "sharing_service_detector",
             "suspicious_process_detector",
+            "hardware_device_detector",
         ]
         self._detector_enabled_flags = {
             "detector_enabled_camera": "1",
             "detector_enabled_session": "1",
+            "detector_enabled_network": "1",
+            "detector_enabled_persistence": "1",
             "detector_enabled_sharing": "1",
             "detector_enabled_process": "1",
+            "detector_enabled_hardware": "1",
         }
         self._ensure_log_paths()
         if self.record_startup:
@@ -196,7 +235,14 @@ class BackgroundMonitorService:
             self._write_log_line(f"startup: monitor initialized | db_path={self.db.path}")
             self._record_startup_diagnostics()
             self.record_startup = True
+        self.notifications.start_cfaa_login_acknowledgment()
+        self.session_observer.start()
+        self.network_observer.start()
+        self.usb_observer.start()
         while True:
+            self.notifications.poll_cfaa_login_acknowledgment()
+            self.notifications.start_cfaa_login_acknowledgment()
+            self.notifications.reconcile_security_overlay()
             self.run_once()
             time.sleep(self.poll_interval_seconds)
 
@@ -209,14 +255,20 @@ class BackgroundMonitorService:
         detector_specs = [
             ("camera_process_detector", self._run_camera_detector),
             ("screen_session_detector", self._run_session_detector),
+            ("network_state_detector", self._run_network_detector),
+            ("persistence_detector", self._run_persistence_detector),
             ("sharing_service_detector", self._run_sharing_detector),
             ("suspicious_process_detector", self._run_suspicious_process_detector),
+            ("hardware_device_detector", self._run_hardware_detector),
         ]
         zero_reason_map = {
             "camera_process_detector": "no capture-capable process found",
             "screen_session_detector": "no display state change",
+            "network_state_detector": "no network IP assignment or VPN state change",
+            "persistence_detector": "no persistence inventory change",
             "sharing_service_detector": "no sharing state change",
             "suspicious_process_detector": "no suspicious process found",
+            "hardware_device_detector": "no USB topology change or explicit moisture marker found",
         }
         for name, detector in detector_specs:
             self._write_log_line(f"detector started: {name}")
@@ -380,6 +432,16 @@ class BackgroundMonitorService:
         session_events = self._simulate_session_detector_events(target, source=source)
         if session_events:
             return self._record_simulated_detector_events(session_events, preferred_type=target, notify_force=notify_force)
+        network_event = self._simulate_network_detector_event(target, source=source)
+        if network_event is not None:
+            network_event.simulated = True
+            self.record_monitor_event(network_event, notify_force=notify_force)
+            return network_event
+        persistence_event = self._simulate_persistence_detector_event(target, source=source)
+        if persistence_event is not None:
+            persistence_event.simulated = True
+            self.record_monitor_event(persistence_event, notify_force=notify_force)
+            return persistence_event
         sharing_event = self._simulate_sharing_detector_event(target, source=source)
         if sharing_event is not None:
             sharing_event.simulated = True
@@ -477,6 +539,57 @@ class BackgroundMonitorService:
             return []
         return self.session_monitor.evaluate(previous, current)
 
+    def _simulate_network_detector_event(self, event_type: str, *, source: str) -> BackgroundMonitorEvent | None:
+        if event_type == "network_ip_assigned":
+            return self._build_event(
+                "network_ip_assigned",
+                "Simulated network IP assignment event.",
+                severity="info",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        if event_type == "vpn_connected":
+            return self._build_event(
+                "vpn_connected",
+                "Simulated VPN connection event.",
+                severity="info",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        return None
+
+    def _simulate_persistence_detector_event(self, event_type: str, *, source: str) -> BackgroundMonitorEvent | None:
+        if event_type == "launchdaemon_added":
+            return self._build_event(
+                "launchdaemon_added",
+                "Simulated startup daemon added event.",
+                severity="critical",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        if event_type == "launchagent_added":
+            return self._build_event(
+                "launchagent_added",
+                "Simulated launch agent added event.",
+                severity="high",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        if event_type in {"persistence_item_created", "persistence_item_created_high_risk"}:
+            return self._build_event(
+                "persistence_item_created_high_risk",
+                "Simulated persistence item added event.",
+                severity="critical",
+                confidence="high",
+                simulated=True,
+                source=source,
+            )
+        return None
+
     def _simulate_sharing_detector_event(self, event_type: str, *, source: str) -> BackgroundMonitorEvent | None:
         if event_type == "screen_sharing_enabled":
             return self._build_event(
@@ -527,15 +640,18 @@ class BackgroundMonitorService:
             "detector_last_run_counts": status.detector_last_run_counts,
             "detector_enabled_camera": status.detector_enabled_camera,
             "detector_enabled_session": status.detector_enabled_session,
+            "detector_enabled_network": status.detector_enabled_network,
+            "detector_enabled_persistence": status.detector_enabled_persistence,
             "detector_enabled_sharing": status.detector_enabled_sharing,
             "detector_enabled_process": status.detector_enabled_process,
+            "detector_enabled_hardware": status.detector_enabled_hardware,
             "detector_last_zero_reason": status.detector_last_zero_reason,
             "current_snapshot": self._load_current_snapshot_state(),
             "current_snapshot_keys": sorted(self._load_current_snapshot_state().keys()),
             "recent_events": [event.to_dict() for event in self.db.latest_monitor_events(limit=5)],
         }
 
-    def record_monitor_event(self, event: BackgroundMonitorEvent, *, notify_force: bool = False) -> str | None:
+    def record_monitor_event(self, event: BackgroundMonitorEvent, *, notify_force: bool = False, _skip_storm_detection: bool = False) -> str | None:
         preference = self.notifications.preference_for(event.event_type)
         if not bool(preference.get("enabled", True)):
             self.db.set_background_monitor_state(
@@ -554,8 +670,32 @@ class BackgroundMonitorService:
             )
             return None
         if not stored:
+            self.notifications.update_security_overlay(event)
             return None
-        if self._should_notify_event(event, notify_force=notify_force):
+        if not _skip_storm_detection:
+            storm_event = self._maybe_build_alert_storm_event(event)
+            if storm_event is not None:
+                self.record_monitor_event(storm_event, notify_force=True, _skip_storm_detection=True)
+        storm_active = self._alert_storm_active(event)
+        if storm_active and event.event_type != "alert_storm_detected":
+            event.suppression_reason = "alert storm active"
+            event.notification_sent = False
+            event.notification_error = ""
+            event.notification_returncode = None
+            event.notification_decision = "log_only"
+            event.notification_reason = "alert_storm_active"
+            event.popup_allowed = False
+            self.db.update_monitor_event_notification(
+                event.event_id,
+                notification_sent=False,
+                notification_error="",
+                notification_returncode=None,
+                notification_decision="log_only",
+                notification_reason="alert_storm_active",
+                cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                popup_allowed=False,
+            )
+        elif self._should_notify_event(event, notify_force=notify_force):
             sent, error = self._notify_event(event, notify_force=notify_force)
             event.notification_sent = sent
             event.notification_error = error
@@ -563,16 +703,29 @@ class BackgroundMonitorService:
             event.notification_sent = False
             event.notification_error = ""
             event.notification_returncode = None
-        self.db.update_monitor_event_notification(
-            event.event_id,
-            notification_sent=event.notification_sent,
-            notification_error=event.notification_error,
-            notification_returncode=event.notification_returncode,
-            notification_decision=event.notification_decision,
-            notification_reason=event.notification_reason,
-            cooldown_remaining_seconds=event.cooldown_remaining_seconds,
-            popup_allowed=event.popup_allowed,
-        )
+            self.db.update_monitor_event_notification(
+                event.event_id,
+                notification_sent=event.notification_sent,
+                notification_error=event.notification_error,
+                notification_returncode=event.notification_returncode,
+                notification_decision=event.notification_decision,
+                notification_reason=event.notification_reason,
+                cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                popup_allowed=event.popup_allowed,
+            )
+        if storm_active and event.event_type == "alert_storm_detected":
+            event.popup_allowed = True
+        if not storm_active or event.event_type == "alert_storm_detected":
+            self.db.update_monitor_event_notification(
+                event.event_id,
+                notification_sent=event.notification_sent,
+                notification_error=event.notification_error,
+                notification_returncode=event.notification_returncode,
+                notification_decision=event.notification_decision,
+                notification_reason=event.notification_reason,
+                cooldown_remaining_seconds=event.cooldown_remaining_seconds,
+                popup_allowed=event.popup_allowed,
+            )
         self._write_log_line(
             f"event: type={event.event_type} severity={event.severity} confidence={event.confidence} "
             f"process_name={event.process_name} pid={event.pid} simulated={event.simulated} "
@@ -583,6 +736,83 @@ class BackgroundMonitorService:
             f"notification_error={event.notification_error} evidence={event.evidence}"
         )
         return event.event_id
+
+    def _storm_group_key(self, event: BackgroundMonitorEvent) -> str:
+        return "|".join(
+            [
+                event.event_type,
+                event.trigger_source or event.source,
+                event.related_process,
+                event.related_path,
+                event.correlation_id,
+            ]
+        )
+
+    def _alert_storm_active(self, event: BackgroundMonitorEvent) -> bool:
+        raw_until = self.db.get_background_monitor_state("alert_storm_active_until", "")
+        if not raw_until:
+            return False
+        try:
+            return datetime.fromisoformat(raw_until) > datetime.fromisoformat(event.timestamp)
+        except ValueError:
+            return False
+
+    def _maybe_build_alert_storm_event(self, event: BackgroundMonitorEvent) -> BackgroundMonitorEvent | None:
+        if event.event_type == "alert_storm_detected":
+            return None
+        cutoff = datetime.fromisoformat(event.timestamp) - timedelta(seconds=ALERT_STORM_WINDOW_SECONDS)
+        recent = [item for item in self.db.recent_background_monitor_events(limit=500) if self._event_time(item) >= cutoff]
+        group_key = self._storm_group_key(event)
+        grouped = [item for item in recent if self._storm_group_key(item) == group_key]
+        if len(grouped) <= ALERT_STORM_THRESHOLD:
+            return None
+        active_until = self.db.get_background_monitor_state("alert_storm_active_until", "")
+        if active_until:
+            try:
+                if datetime.fromisoformat(active_until) > datetime.fromisoformat(event.timestamp):
+                    return None
+            except ValueError:
+                pass
+        event_types = [item.event_type for item in grouped]
+        sources = [item.trigger_source or item.source for item in grouped]
+        top_event_types = ", ".join(sorted({item for item in event_types})[:5])
+        top_sources = ", ".join(sorted({item for item in sources})[:5])
+        summary = f"Alert storm detected from {top_sources or 'unknown source'}"
+        storm_event = self._build_event(
+            "alert_storm_detected",
+            f"{summary}; {len(grouped)} events in the last {ALERT_STORM_WINDOW_SECONDS // 60} minutes. Top types: {top_event_types or 'unknown'}.",
+            severity="high",
+            confidence="medium",
+            source="alert_storm_detector",
+            rule=rule_for_event("alert_storm_detected"),
+            trigger_subsource="alert_storm",
+            previous_state="storm not active",
+            current_state=f"storm active for {group_key}",
+            related_process=event.related_process or event.process_name,
+            related_path=event.related_path,
+            related_user=event.related_user,
+        )
+        storm_event.recommendation = "Review the repeated source, verify whether the detector is noisy, and suppress or fix the underlying burst before relying on individual alerts."
+        storm_event.raw_signal_summary = summary
+        storm_event.source_trace = f"Storm grouping key={group_key}; count={len(grouped)}; top_sources={top_sources}; top_event_types={top_event_types}"
+        storm_event.first_seen = min(item.first_seen or item.timestamp for item in grouped)
+        storm_event.last_seen = max(item.last_seen or item.timestamp for item in grouped)
+        storm_event.previous_state = "no storm"
+        storm_event.current_state = f"{len(grouped)} events in {ALERT_STORM_WINDOW_SECONDS // 60} minutes"
+        storm_event.false_positive_hints = ["benign noisy app", "broken detector", "automation or install churn"]
+        storm_event.recommended_verification_steps = [
+            "Check whether the repeated source matches an installer, updater, or looped detector.",
+            "Review the event group and confirm whether a detector bug is producing duplicates.",
+        ]
+        self.db.set_background_monitor_state("alert_storm_active_until", (datetime.fromisoformat(event.timestamp) + timedelta(seconds=ALERT_STORM_WINDOW_SECONDS)).isoformat())
+        self.db.set_background_monitor_state("alert_storm_group_key", group_key)
+        return storm_event
+
+    def _event_time(self, event: BackgroundMonitorEvent) -> datetime:
+        try:
+            return datetime.fromisoformat(event.timestamp)
+        except ValueError:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
 
     def _should_notify_event(self, event: BackgroundMonitorEvent, *, notify_force: bool = False) -> bool:
         try:
@@ -703,6 +933,26 @@ class BackgroundMonitorService:
         return recorded
 
     def _run_session_detector(self) -> list[BackgroundMonitorEvent]:
+        if self.session_observer.running:
+            current = self.session_observer.current_snapshot or self.session_monitor.collect_snapshot()
+            events = self.session_observer.drain()
+            self.latest_snapshot.update(
+                {
+                    "display_state": current.display_state,
+                    "system_power_state": current.system_power_state,
+                    "session_locked": current.session_locked,
+                    "clamshell_state": current.clamshell_state,
+                    "hid_idle_seconds": current.hid_idle_seconds,
+                }
+            )
+            self._store_current_snapshot()
+            recorded = []
+            for event in events:
+                if event.event_type not in IMPORTANT_EVENT_TYPES and event.event_type in {"display_sleep", "display_wake", "possible_lid_closed", "possible_lid_opened", "display_state_changed"}:
+                    event.confidence = "medium"
+                if self.record_monitor_event(event):
+                    recorded.append(event)
+            return recorded
         current = self.session_monitor.collect_snapshot()
         self.latest_snapshot.update(
             {
@@ -710,6 +960,7 @@ class BackgroundMonitorService:
                 "system_power_state": current.system_power_state,
                 "session_locked": current.session_locked,
                 "clamshell_state": current.clamshell_state,
+                "hid_idle_seconds": current.hid_idle_seconds,
             }
         )
         self._store_current_snapshot()
@@ -719,8 +970,76 @@ class BackgroundMonitorService:
         for event in events:
             if event.event_type not in IMPORTANT_EVENT_TYPES and event.event_type in {"display_sleep", "display_wake", "possible_lid_closed", "possible_lid_opened", "display_state_changed"}:
                 event.confidence = "medium"
+                if self.record_monitor_event(event):
+                    recorded.append(event)
+            return recorded
+
+    def _run_network_detector(self) -> list[BackgroundMonitorEvent]:
+        if self.network_observer.running:
+            current = self.network_observer.current_snapshot or self.network_monitor.collect_snapshot()
+            events = self.network_observer.drain()
+            self.latest_snapshot.update(
+                {
+                    "network_interface": current.interface,
+                    "network_ip_address": current.ip_address,
+                    "network_netmask": current.netmask,
+                    "network_gateway": current.gateway,
+                    "network_subnet": current.subnet,
+                    "network_scope": current.scope,
+                    "vpn_interfaces": current.vpn_interfaces,
+                }
+            )
+            self._store_current_snapshot()
+            recorded = []
+            for event in events:
+                if self.record_monitor_event(event):
+                    recorded.append(event)
+            self.previous_network = current
+            return recorded
+        current = self.network_monitor.collect_snapshot()
+        self.latest_snapshot.update(
+            {
+                "network_interface": current.interface,
+                "network_ip_address": current.ip_address,
+                "network_netmask": current.netmask,
+                "network_gateway": current.gateway,
+                "network_subnet": current.subnet,
+                "network_scope": current.scope,
+                "vpn_interfaces": current.vpn_interfaces,
+            }
+        )
+        self._store_current_snapshot()
+        events = self.network_monitor.evaluate(self.previous_network, current)
+        self.previous_network = current
+        recorded = []
+        for event in events:
             if self.record_monitor_event(event):
                 recorded.append(event)
+        return recorded
+
+    def _run_persistence_detector(self) -> list[BackgroundMonitorEvent]:
+        current = self.persistence_monitor.collect_snapshot()
+        had_previous = self.previous_persistence is not None
+        previous_inventory = self.persistence_monitor.summarize_inventory(self.previous_persistence) if self.previous_persistence else {"launch_daemons": [], "launch_agents": [], "login_items": []}
+        current_inventory = self.persistence_monitor.summarize_inventory(current)
+        self._write_log_line(f"persistence inventory previous: {json.dumps(previous_inventory, sort_keys=True)}")
+        self._write_log_line(f"persistence inventory current: {json.dumps(current_inventory, sort_keys=True)}")
+        self.latest_snapshot.update(
+            {
+                "launch_daemons": current_inventory["launch_daemons"],
+                "launch_agents": current_inventory["launch_agents"],
+                "login_items": current_inventory["login_items"],
+            }
+        )
+        self._store_current_snapshot()
+        events = self.persistence_monitor.evaluate(self.previous_persistence, current)
+        self.previous_persistence = current
+        recorded: list[BackgroundMonitorEvent] = []
+        for event in events:
+            if self.record_monitor_event(event):
+                recorded.append(event)
+        if not had_previous and not events:
+            self._write_log_line("persistence baseline established")
         return recorded
 
     def _run_sharing_detector(self) -> list[BackgroundMonitorEvent]:
@@ -784,6 +1103,98 @@ class BackgroundMonitorService:
                     break
         return events
 
+    def _run_hardware_detector(self) -> list[BackgroundMonitorEvent]:
+        current = self.hardware_monitor.collect_snapshot()
+        self.latest_snapshot.update(
+            {
+                "usb_devices": current.usb_devices,
+                "moisture_detection_capability": current.moisture_capability,
+                "moisture_markers": sorted(current.moisture_markers),
+            }
+        )
+        self._store_current_snapshot()
+        events = self.hardware_monitor.evaluate(self.previous_hardware, current, include_usb=not self.usb_observer.running)
+        events.extend(self._classify_usb_observer_events(self.usb_observer.drain(), current.usb_devices))
+        self.previous_hardware = current
+        recorded = []
+        for event in events:
+            if self.record_monitor_event(event):
+                recorded.append(event)
+        return recorded
+
+    def _coalesce_usb_observer_events(self, events: list[BackgroundMonitorEvent]) -> list[BackgroundMonitorEvent]:
+        if not events:
+            return events
+        labels = sorted({self._usb_observer_label(event) for event in events})
+        summary = "; ".join(labels[:4])
+        if len(labels) > 4:
+            summary += f"; and {len(labels) - 4} more"
+        return [
+            self._build_event(
+                "usb_device_connected",
+                f"USB reconnect recognized {len(labels)} device(s): {summary}.",
+                severity="info",
+                confidence="high",
+                source="ioreg_usb_observer",
+            )
+        ]
+
+    def _classify_usb_observer_events(
+        self,
+        events: list[BackgroundMonitorEvent],
+        current_devices: list[dict[str, str]],
+    ) -> list[BackgroundMonitorEvent]:
+        raw_trusted = self.db.get_background_monitor_state(TRUSTED_USB_DEVICES_STATE_KEY, "")
+        current_identities = {self.hardware_monitor.usb_physical_key(item) for item in current_devices}
+        if not raw_trusted:
+            self._store_trusted_usb_identities(current_identities)
+            return self._coalesce_usb_observer_events(events)
+        try:
+            trusted = set(json.loads(raw_trusted))
+        except json.JSONDecodeError:
+            trusted = set()
+        new_events = [event for event in events if self._usb_event_physical_key(event) not in trusted]
+        if not new_events:
+            return self._coalesce_usb_observer_events(events)
+        trusted.update(self._usb_event_physical_key(event) for event in new_events)
+        self._store_trusted_usb_identities(trusted)
+        labels = sorted({self._usb_observer_label(event) for event in new_events})
+        summary = "; ".join(labels[:4])
+        if len(labels) > 4:
+            summary += f"; and {len(labels) - 4} more"
+        return [
+            self._build_event(
+                "new_usb_device_detected",
+                f"New USB device identity detected: {summary}.",
+                severity="critical",
+                confidence="high",
+                source="ioreg_usb_observer",
+            )
+        ]
+
+    def _usb_event_physical_key(self, event: BackgroundMonitorEvent) -> str:
+        try:
+            metadata = json.loads(event.metadata_json)
+        except json.JSONDecodeError:
+            metadata = {}
+        return self.hardware_monitor.usb_physical_key(metadata)
+
+    def _store_trusted_usb_identities(self, identities: set[str]) -> None:
+        self.db.set_background_monitor_state(TRUSTED_USB_DEVICES_STATE_KEY, json.dumps(sorted(identities)))
+
+    def _usb_observer_label(self, event: BackgroundMonitorEvent) -> str:
+        try:
+            metadata = json.loads(event.metadata_json)
+        except json.JSONDecodeError:
+            metadata = {}
+        vendor = str(metadata.get("vendor", "")).strip()
+        name = str(metadata.get("name", "")).strip()
+        serial = str(metadata.get("serial", "")).strip()
+        label = f"{vendor} {name}".strip()
+        if label:
+            return f"{label} (serial={serial})" if serial else label
+        return event.evidence.removeprefix("USB device recognized: ").removesuffix(".")
+
     def collect_detector_snapshot(self) -> dict[str, object]:
         snapshot = {
             "timestamp": utc_now_iso(),
@@ -822,6 +1233,25 @@ class BackgroundMonitorService:
             snapshot["remote_login_enabled"] = self._remote_login_enabled()
         except Exception as exc:
             self._write_log_line(f"snapshot sharing error: {exc}")
+        try:
+            current_network = self.network_monitor.collect_snapshot()
+            snapshot["network_interface"] = current_network.interface
+            snapshot["network_ip_address"] = current_network.ip_address
+            snapshot["network_netmask"] = current_network.netmask
+            snapshot["network_gateway"] = current_network.gateway
+            snapshot["network_subnet"] = current_network.subnet
+            snapshot["network_scope"] = current_network.scope
+            snapshot["vpn_interfaces"] = current_network.vpn_interfaces
+        except Exception as exc:
+            self._write_log_line(f"snapshot network error: {exc}")
+        try:
+            current_persistence = self.persistence_monitor.collect_snapshot()
+            current_inventory = self.persistence_monitor.summarize_inventory(current_persistence)
+            snapshot["launch_daemons"] = current_inventory["launch_daemons"]
+            snapshot["launch_agents"] = current_inventory["launch_agents"]
+            snapshot["login_items"] = current_inventory["login_items"]
+        except Exception as exc:
+            self._write_log_line(f"snapshot persistence error: {exc}")
         if privacy is None:
             snapshot["capture_capable_processes"] = snapshot.get("capture_capable_processes", [])
             snapshot["screen_sharing_enabled"] = bool(snapshot.get("screen_sharing_enabled", False))
@@ -906,6 +1336,8 @@ class BackgroundMonitorService:
             return len(self.previous_privacy.capture_capable_processes)
         if detector_name == "screen_session_detector" and self.previous_session is not None:
             return len(self.previous_session.recent_markers)
+        if detector_name == "persistence_detector" and self.previous_persistence is not None:
+            return len(self.previous_persistence.launch_items) + len(self.previous_persistence.login_items)
         if detector_name == "sharing_service_detector":
             return sum(1 for value in self.sharing_state.values() if value is not None)
         if detector_name == "suspicious_process_detector":
@@ -913,6 +1345,8 @@ class BackgroundMonitorService:
                 return sum(1 for item in self._list_processes() if any(str(item.get("args", "")).startswith(prefix) for prefix in SUSPICIOUS_PROCESS_PREFIXES))
             except Exception:
                 return 0
+        if detector_name == "hardware_device_detector" and self.previous_hardware is not None:
+            return len(self.previous_hardware.usb_devices) + len(self.previous_hardware.moisture_markers)
         return 0
 
     def _list_processes(self) -> list[dict[str, object]]:
@@ -993,10 +1427,25 @@ class BackgroundMonitorService:
         simulated: bool = False,
         process_name: str = "",
         pid: int | None = None,
+        rule=None,
+        trigger_subsource: str = "",
+        previous_state: str = "",
+        current_state: str = "",
+        related_path: str = "",
+        related_user: str = "",
+        related_network_endpoint: str = "",
+        related_url: str = "",
+        related_dom_selector: str = "",
+        related_file_hash: str = "",
+        related_parent_pid: int | None = None,
+        related_process: str = "",
     ) -> BackgroundMonitorEvent:
+        rule = rule or rule_for_event(event_type)
+        raw_signal = evidence
+        timestamp = utc_now_iso()
         return BackgroundMonitorEvent(
-            event_id=f"{event_type}-{utc_now_iso()}-{process_name or source}",
-            timestamp=utc_now_iso(),
+            event_id=f"{event_type}-{timestamp}-{process_name or source}",
+            timestamp=timestamp,
             event_type=event_type,
             severity=severity,
             confidence=confidence,
@@ -1007,6 +1456,33 @@ class BackgroundMonitorService:
             simulated=simulated,
             recommendation="Review the event context and verify whether the activity was expected.",
             metadata_json="{}",
+            rule_id=rule.rule_id,
+            rule_name=rule.name,
+            trigger_source=source,
+            trigger_subsource=trigger_subsource or source,
+            trigger_rule_id=rule.rule_id,
+            trigger_rule_name=rule.name,
+            raw_signal_summary=raw_signal,
+            normalized_signal=normalized_signal(event_type, raw_signal, process_name, pid, related_path, related_user),
+            evidence_hash=evidence_hash(event_type, raw_signal, process_name, pid, related_path, related_user),
+            related_process=related_process or process_name,
+            related_pid=pid,
+            related_parent_pid=related_parent_pid,
+            related_path=related_path,
+            related_user=related_user,
+            related_network_endpoint=related_network_endpoint,
+            related_url=related_url,
+            related_dom_selector=related_dom_selector,
+            related_file_hash=related_file_hash,
+            first_seen=timestamp,
+            last_seen=timestamp,
+            previous_state=previous_state,
+            current_state=current_state,
+            baseline_status="monitor observation",
+            correlation_id=correlation_id_for(event_type, source, process_name, related_path, related_user, timestamp=timestamp),
+            false_positive_hints=list(rule.false_positive_hints),
+            recommended_verification_steps=list(rule.verification_steps),
+            source_trace=f"Detector={rule.source_detector}; Rule={rule.rule_id}; Evidence={raw_signal}",
         )
 
     def _ensure_log_paths(self) -> None:
@@ -1042,7 +1518,7 @@ class BackgroundMonitorService:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Background Privacy & Session Monitor")
-    parser.add_argument("--db-path", type=Path, default=Path.home() / ".mac_audit_agent.sqlite3")
+    parser.add_argument("--db-path", type=Path, default=default_monitor_db_path())
     parser.add_argument("--poll-interval", type=int, default=5)
     parser.add_argument("--run", action="store_true")
     parser.add_argument("--once", action="store_true")

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mac_audit_agent.models import BackgroundMonitorEvent, utc_now_iso
+from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_event
 
 
 CAPTURE_PROCESS_KEYWORDS = [
@@ -129,6 +130,9 @@ class PrivacyMonitor:
                     confidence="low",
                     recommendation="Review whether the app was expected to be open and capable of capture.",
                     metadata=item,
+                    rule=rule_for_event("capture_capable_process_observed"),
+                    previous_state="not observed",
+                    current_state=str(item.get("name", "")),
                 )
             )
         for key, item in previous_capture.items():
@@ -146,6 +150,9 @@ class PrivacyMonitor:
                     confidence="low",
                     recommendation="Correlate the closure with expected user activity.",
                     metadata=item,
+                    rule=rule_for_event("capture_capable_process_closed"),
+                    previous_state=str(item.get("name", "")),
+                    current_state="closed",
                 )
             )
 
@@ -160,6 +167,9 @@ class PrivacyMonitor:
                     confidence="high",
                     recommendation="Confirm whether camera use is expected and close the app if it is not.",
                     metadata={"authorization": current.camera_authorization},
+                    rule=rule_for_event("camera_activity_confirmed"),
+                    previous_state="camera inactive",
+                    current_state="camera active signal present",
                 )
             )
         else:
@@ -180,6 +190,9 @@ class PrivacyMonitor:
                         confidence="medium",
                         recommendation="Confirm whether camera use is expected and close the related app if it is not.",
                         metadata=item,
+                        rule=rule_for_event("camera_activity_suspected"),
+                        previous_state="helper not observed",
+                        current_state=str(item.get("name", "")),
                     )
                 )
             if current.capture_capable_processes and current.camera_helper_processes:
@@ -195,6 +208,9 @@ class PrivacyMonitor:
                         confidence="medium",
                         recommendation="Confirm whether camera use is expected and close the related app if it is not.",
                         metadata={"apps": current.capture_capable_processes, "helpers": current.camera_helper_processes},
+                        rule=rule_for_event("camera_activity_suspected"),
+                        previous_state="apps/helpers not correlated",
+                        current_state=f"apps={app_names}; helpers={helper_names}",
                     )
                 )
 
@@ -215,6 +231,9 @@ class PrivacyMonitor:
                     confidence="low",
                     recommendation="Check whether the listed app is expected to use the microphone right now.",
                     metadata=item,
+                    rule=rule_for_event("microphone_activity_suspected"),
+                    previous_state="not observed",
+                    current_state=str(item.get("name", "")),
                 )
             )
 
@@ -233,6 +252,9 @@ class PrivacyMonitor:
                     confidence="high",
                     recommendation="Review whether the app should retain Screen Recording permission.",
                     metadata=item,
+                    rule=rule_for_event("screen_recording_permission_present"),
+                    previous_state="permission absent",
+                    current_state=str(item.get("client", "")),
                 )
             )
 
@@ -251,6 +273,9 @@ class PrivacyMonitor:
                     confidence="medium",
                     recommendation="Review whether the app should retain Camera permission.",
                     metadata=item,
+                    rule=rule_for_event("camera_activity_suspected"),
+                    previous_state="permission absent",
+                    current_state=str(item.get("client", "")),
                 )
             )
 
@@ -269,6 +294,9 @@ class PrivacyMonitor:
                     confidence="medium",
                     recommendation="Review whether the app should retain Microphone permission.",
                     metadata=item,
+                    rule=rule_for_event("microphone_activity_suspected"),
+                    previous_state="permission absent",
+                    current_state=str(item.get("client", "")),
                 )
             )
 
@@ -348,7 +376,12 @@ class PrivacyMonitor:
         process_name: str = "",
         pid: int | None = None,
         metadata: dict,
+        rule=None,
+        previous_state: str = "",
+        current_state: str = "",
     ) -> BackgroundMonitorEvent:
+        rule = rule or rule_for_event(event_type)
+        raw_summary = evidence
         return BackgroundMonitorEvent(
             event_id=f"{event_type}-{timestamp}-{process_name or source}",
             timestamp=timestamp,
@@ -361,6 +394,26 @@ class PrivacyMonitor:
             confidence=confidence,
             recommendation=recommendation,
             metadata_json=json.dumps(self._sanitize_metadata(metadata), sort_keys=True),
+            rule_id=rule.rule_id,
+            rule_name=rule.name,
+            trigger_source="privacy_monitor",
+            trigger_subsource=source,
+            trigger_rule_id=rule.rule_id,
+            trigger_rule_name=rule.name,
+            raw_signal_summary=raw_summary,
+            normalized_signal=normalized_signal(event_type, raw_summary, process_name, metadata),
+            evidence_hash=evidence_hash(event_type, raw_summary, process_name, metadata),
+            related_process=process_name,
+            related_pid=pid,
+            first_seen=timestamp,
+            last_seen=timestamp,
+            previous_state=previous_state,
+            current_state=current_state,
+            baseline_status="privacy state change",
+            correlation_id=correlation_id_for(event_type, source, process_name, timestamp=timestamp),
+            false_positive_hints=list(rule.false_positive_hints),
+            recommended_verification_steps=list(rule.verification_steps),
+            source_trace=f"Detector={rule.source_detector}; Rule={rule.rule_id}; Evidence={raw_summary}",
         )
 
     def _sanitize_metadata(self, metadata: dict) -> dict:

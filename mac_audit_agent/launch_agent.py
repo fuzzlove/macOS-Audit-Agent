@@ -19,6 +19,13 @@ LAUNCH_AGENT_LABEL = "com.mac-audit-agent.monitor"
 LAUNCHCTL_BIN = "/bin/launchctl"
 PLUTIL_BIN = "/usr/bin/plutil"
 LOG_BIN = "/usr/bin/log"
+MAC_AUDIT_AGENT_ENV_SCOPE = "MAC_AUDIT_AGENT_LAUNCH_SCOPE"
+MAC_AUDIT_AGENT_ENV_RUNTIME_ROOT = "MAC_AUDIT_AGENT_RUNTIME_ROOT"
+MAC_AUDIT_AGENT_ENV_LOG_ROOT = "MAC_AUDIT_AGENT_LOG_ROOT"
+MAC_AUDIT_AGENT_ENV_DB_PATH = "MAC_AUDIT_AGENT_DB_PATH"
+SYSTEM_RUNTIME_ROOT = Path("/Library/Application Support/MacAuditAgent/runtime")
+SYSTEM_LOG_ROOT = Path("/Library/Logs/MacAuditAgent")
+SYSTEM_DB_PATH = Path("/Library/Application Support/MacAuditAgent/mac_audit_agent.sqlite3")
 
 
 def project_root() -> Path:
@@ -29,16 +36,42 @@ def monitor_script_path() -> Path:
     return project_root() / "mac_audit_agent" / "monitor.py"
 
 
-def runtime_root() -> Path:
+def launch_scope(default: str = "user") -> str:
+    scope = os.environ.get(MAC_AUDIT_AGENT_ENV_SCOPE, default).strip().lower()
+    return "system" if scope == "system" else "user"
+
+
+def runtime_root(scope: str | None = None) -> Path:
+    scope = launch_scope() if scope is None else launch_scope(scope)
+    if scope == "system":
+        return Path(os.environ.get(MAC_AUDIT_AGENT_ENV_RUNTIME_ROOT, str(SYSTEM_RUNTIME_ROOT))).expanduser()
     return Path.home() / ".mac_audit_agent" / "runtime"
 
 
-def runtime_package_root() -> Path:
-    return runtime_root() / "mac_audit_agent"
+def runtime_package_root(scope: str | None = None) -> Path:
+    if scope is None:
+        return runtime_root() / "mac_audit_agent"
+    return runtime_root(scope) / "mac_audit_agent"
 
 
-def runtime_monitor_script_path() -> Path:
-    return runtime_package_root() / "monitor.py"
+def runtime_monitor_script_path(scope: str | None = None) -> Path:
+    if scope is None:
+        return runtime_package_root() / "monitor.py"
+    return runtime_package_root(scope) / "monitor.py"
+
+
+def monitor_log_root(scope: str | None = None) -> Path:
+    scope = launch_scope() if scope is None else launch_scope(scope)
+    if scope == "system":
+        return Path(os.environ.get(MAC_AUDIT_AGENT_ENV_LOG_ROOT, str(SYSTEM_LOG_ROOT))).expanduser()
+    return Path.home() / ".mac_audit_agent" / "logs"
+
+
+def default_monitor_db_path(scope: str | None = None) -> Path:
+    scope = launch_scope() if scope is None else launch_scope(scope)
+    if scope == "system":
+        return Path(os.environ.get(MAC_AUDIT_AGENT_ENV_DB_PATH, str(SYSTEM_DB_PATH))).expanduser()
+    return Path.home() / ".mac_audit_agent.sqlite3"
 
 
 @dataclass
@@ -48,9 +81,10 @@ class LaunchAgentPaths:
     stderr_path: Path
 
 
-def default_launch_agent_paths() -> LaunchAgentPaths:
-    logs_dir = Path.home() / ".mac_audit_agent" / "logs"
-    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+def default_launch_agent_paths(scope: str | None = None) -> LaunchAgentPaths:
+    scope = launch_scope() if scope is None else launch_scope(scope)
+    logs_dir = monitor_log_root(scope)
+    launch_agents_dir = Path("/Library/LaunchDaemons") if scope == "system" else Path.home() / "Library" / "LaunchAgents"
     return LaunchAgentPaths(
         plist_path=launch_agents_dir / f"{LAUNCH_AGENT_LABEL}.plist",
         stdout_path=logs_dir / "background_monitor.stdout.log",
@@ -58,15 +92,19 @@ def default_launch_agent_paths() -> LaunchAgentPaths:
     )
 
 
-def launchctl_target() -> str:
+def launchctl_target(scope: str | None = None) -> str:
+    scope = launch_scope() if scope is None else launch_scope(scope)
+    if scope == "system":
+        return "system"
     return f"gui/{os.getuid()}"
 
 
-def build_launch_agent_plist(*, db_path: Path, poll_interval_seconds: int = 15, python_executable: str | None = None) -> dict:
-    paths = default_launch_agent_paths()
-    root = runtime_root()
-    monitor_path = runtime_monitor_script_path()
-    return {
+def build_launch_agent_plist(*, db_path: Path, poll_interval_seconds: int = 15, python_executable: str | None = None, scope: str = "user") -> dict:
+    scope = launch_scope(scope)
+    paths = default_launch_agent_paths(scope)
+    root = runtime_root("system") if scope == "system" else runtime_root()
+    monitor_path = runtime_monitor_script_path("system") if scope == "system" else runtime_monitor_script_path()
+    payload = {
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": [
             python_executable or "/usr/bin/python3",
@@ -75,14 +113,20 @@ def build_launch_agent_plist(*, db_path: Path, poll_interval_seconds: int = 15, 
         ],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "ProcessType": "Interactive",
         "WorkingDirectory": str(root),
         "EnvironmentVariables": {
             "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            MAC_AUDIT_AGENT_ENV_SCOPE: scope,
+            MAC_AUDIT_AGENT_ENV_RUNTIME_ROOT: str(root),
+            MAC_AUDIT_AGENT_ENV_LOG_ROOT: str(monitor_log_root(scope)),
+            MAC_AUDIT_AGENT_ENV_DB_PATH: str(db_path),
         },
         "StandardOutPath": str(paths.stdout_path),
         "StandardErrorPath": str(paths.stderr_path),
     }
+    if scope == "user":
+        payload["ProcessType"] = "Interactive"
+    return payload
 
 
 def _format_command(command: list[str]) -> str:
@@ -93,22 +137,39 @@ PID_RE = re.compile(r"\bpid = (\d+)\b")
 
 
 class LaunchAgentManager:
-    def __init__(self, db_path: Path, runner=None) -> None:
+    def __init__(self, db_path: Path, runner=None, scope: str = "user") -> None:
         self.db_path = db_path
-        self.paths = default_launch_agent_paths()
+        self.scope = launch_scope(scope)
+        self.paths = default_launch_agent_paths(self.scope)
         self.runner = runner or subprocess.run
 
+    def _runtime_root(self) -> Path:
+        return runtime_root("system") if self.scope == "system" else runtime_root()
+
+    def _runtime_package_root(self) -> Path:
+        return runtime_package_root("system") if self.scope == "system" else runtime_package_root()
+
+    def _runtime_monitor_script_path(self) -> Path:
+        return runtime_monitor_script_path("system") if self.scope == "system" else runtime_monitor_script_path()
+
+    def _launchctl_target(self) -> str:
+        return launchctl_target("system") if self.scope == "system" else launchctl_target()
+
     def install(self, poll_interval_seconds: int = 15) -> Path:
-        payload = build_launch_agent_plist(db_path=self.db_path, poll_interval_seconds=poll_interval_seconds)
+        if self.scope == "system" and os.geteuid() != 0:
+            raise RuntimeError("System LaunchDaemon installation requires root privileges.")
+        payload = build_launch_agent_plist(db_path=self.db_path, poll_interval_seconds=poll_interval_seconds, scope=self.scope)
         if payload.get("Label") != LAUNCH_AGENT_LABEL:
             raise RuntimeError(f"Invalid LaunchAgent Label: expected {LAUNCH_AGENT_LABEL}, got {payload.get('Label')}")
-        self._ensure_user_paths()
+        self._ensure_install_paths()
         self._install_runtime_files()
         self.paths.plist_path.write_bytes(plistlib.dumps(payload))
         os.chmod(self.paths.plist_path, 0o644)
         current_user = pwd.getpwuid(os.getuid())
-        staff_gid = grp.getgrnam("staff").gr_gid
-        os.chown(self.paths.plist_path, current_user.pw_uid, staff_gid)
+        target_group = "wheel" if self.scope == "system" else "staff"
+        target_uid = 0 if self.scope == "system" else current_user.pw_uid
+        target_gid = grp.getgrnam(target_group).gr_gid
+        os.chown(self.paths.plist_path, target_uid, target_gid)
         self._run([PLUTIL_BIN, "-lint", str(self.paths.plist_path)])
         return self.paths.plist_path
 
@@ -170,17 +231,17 @@ class LaunchAgentManager:
                 tolerate=self._bootout_tolerate(),
             )
         try:
-            self._run([LAUNCHCTL_BIN, "bootstrap", launchctl_target(), str(self.paths.plist_path)], tolerate={"already bootstrapped"})
+            self._run([LAUNCHCTL_BIN, "bootstrap", self._launchctl_target(), str(self.paths.plist_path)], tolerate={"already bootstrapped"})
         except Exception as exc:
             launchd_tail = self._launchd_log_tail()
             message = str(exc)
             if launchd_tail:
                 message = f"{message}\nlaunchd log tail:\n{launchd_tail}"
             raise RuntimeError(message) from exc
-        self._run([LAUNCHCTL_BIN, "kickstart", "-k", f"{launchctl_target()}/{LAUNCH_AGENT_LABEL}"])
+        self._run([LAUNCHCTL_BIN, "kickstart", "-k", f"{self._launchctl_target()}/{LAUNCH_AGENT_LABEL}"])
 
     def stop(self) -> None:
-        self._run([LAUNCHCTL_BIN, "bootout", launchctl_target(), str(self.paths.plist_path)], tolerate={"could not find specified service"})
+        self._run([LAUNCHCTL_BIN, "bootout", self._launchctl_target(), str(self.paths.plist_path)], tolerate={"could not find specified service"})
 
     def status(self) -> BackgroundMonitorStatus:
         installed = self.paths.plist_path.exists()
@@ -189,7 +250,7 @@ class LaunchAgentManager:
         last_error = ""
         process_pid = None
         if installed:
-            command = [LAUNCHCTL_BIN, "print", f"{launchctl_target()}/{LAUNCH_AGENT_LABEL}"]
+            command = [LAUNCHCTL_BIN, "print", f"{self._launchctl_target()}/{LAUNCH_AGENT_LABEL}"]
             result = self._run(command, check=False)
             stdout = (result.stdout or "").lower()
             loaded = result.returncode == 0
@@ -211,7 +272,7 @@ class LaunchAgentManager:
             db_path=str(self.db_path),
             process_pid=process_pid,
             last_error=last_error,
-            current_launchctl_domain=launchctl_target(),
+            current_launchctl_domain=self._launchctl_target(),
         )
 
     def show_logs(self) -> str:
@@ -221,7 +282,7 @@ class LaunchAgentManager:
         self._run([PLUTIL_BIN, "-lint", str(self.paths.plist_path)])
         payload = plistlib.loads(self.paths.plist_path.read_bytes())
         program_arguments = list(payload.get("ProgramArguments", []))
-        expected_program_arguments = ["/usr/bin/python3", str(runtime_monitor_script_path()), "--run"]
+        expected_program_arguments = ["/usr/bin/python3", str(self._runtime_monitor_script_path()), "--run"]
         if program_arguments != expected_program_arguments:
             raise RuntimeError(
                 "LaunchAgent preflight failed: ProgramArguments must be "
@@ -232,9 +293,13 @@ class LaunchAgentManager:
             raise RuntimeError(f"LaunchAgent preflight failed: WorkingDirectory must not be inside a protected folder: {working_directory}")
         if not working_directory.exists():
             raise RuntimeError(f"LaunchAgent preflight failed: WorkingDirectory does not exist: {working_directory}")
-        if working_directory != runtime_root():
+        if working_directory != self._runtime_root():
             raise RuntimeError(
-                f"LaunchAgent preflight failed: WorkingDirectory must be {runtime_root()}, got {working_directory}"
+                f"LaunchAgent preflight failed: WorkingDirectory must be {self._runtime_root()}, got {working_directory}"
+            )
+        if self.scope == "system" and self.paths.plist_path.parent != Path("/Library/LaunchDaemons"):
+            raise RuntimeError(
+                f"LaunchAgent preflight failed: system LaunchDaemon plist must live in /Library/LaunchDaemons, got {self.paths.plist_path.parent}"
             )
         for log_parent in [self.paths.stdout_path.parent, self.paths.stderr_path.parent]:
             if not log_parent.exists():
@@ -242,12 +307,14 @@ class LaunchAgentManager:
         current_uid = os.getuid()
         plist_stat = self.paths.plist_path.stat()
         mode = stat.S_IMODE(plist_stat.st_mode)
-        if plist_stat.st_uid != current_uid:
+        expected_uid = 0 if self.scope == "system" else current_uid
+        if plist_stat.st_uid != expected_uid:
             owner_name = pwd.getpwuid(plist_stat.st_uid).pw_name
-            current_name = pwd.getpwuid(current_uid).pw_name
+            expected_name = "root" if self.scope == "system" else pwd.getpwuid(current_uid).pw_name
+            expected_group = "wheel" if self.scope == "system" else "staff"
             raise RuntimeError(
-                f"LaunchAgent preflight failed: plist owner is {owner_name}, expected {current_name}. "
-                f"Repair: sudo chown {current_name}:staff {self.paths.plist_path}"
+                f"LaunchAgent preflight failed: plist owner is {owner_name}, expected {expected_name}. "
+                f"Repair: sudo chown {expected_name}:{expected_group} {self.paths.plist_path}"
             )
         if mode != 0o644:
             raise RuntimeError(
@@ -255,31 +322,35 @@ class LaunchAgentManager:
                 f"Repair: chmod 644 {self.paths.plist_path}"
             )
 
-    def _ensure_user_paths(self) -> None:
+    def _ensure_install_paths(self) -> None:
         current_uid = os.getuid()
         current_user = pwd.getpwuid(current_uid)
-        staff_gid = grp.getgrnam("staff").gr_gid
-        for directory in [self.paths.stdout_path.parent, self.paths.plist_path.parent, runtime_root(), runtime_package_root()]:
+        target_group = "wheel" if self.scope == "system" else "staff"
+        target_gid = grp.getgrnam(target_group).gr_gid
+        target_uid = 0 if self.scope == "system" else current_uid
+        for directory in [self.paths.stdout_path.parent, self.paths.plist_path.parent, self._runtime_root(), self._runtime_package_root()]:
             directory.mkdir(parents=True, exist_ok=True)
             try:
                 directory.chmod(0o755)
             except OSError:
                 pass
             try:
-                os.chown(directory, current_uid, staff_gid)
+                os.chown(directory, target_uid, target_gid)
             except OSError:
                 pass
             if not os.access(directory, os.W_OK):
                 raise RuntimeError(
                     f"LaunchAgent path is not writable: {directory}. "
-                    f"Repair: sudo chown -R {current_user.pw_name}:staff {directory}"
+                    f"Repair: sudo chown -R {('root' if self.scope == 'system' else current_user.pw_name)}:{target_group} {directory}"
                 )
 
     def _install_runtime_files(self) -> None:
         source_root = project_root() / "mac_audit_agent"
-        target_root = runtime_package_root()
+        target_root = self._runtime_package_root()
         current_uid = os.getuid()
-        staff_gid = grp.getgrnam("staff").gr_gid
+        target_group = "wheel" if self.scope == "system" else "staff"
+        target_gid = grp.getgrnam(target_group).gr_gid
+        target_uid = 0 if self.scope == "system" else current_uid
         shutil.copytree(
             source_root,
             target_root,
@@ -296,19 +367,19 @@ class LaunchAgentManager:
             except OSError:
                 pass
             try:
-                os.chown(path, current_uid, staff_gid)
+                os.chown(path, target_uid, target_gid)
             except OSError:
                 pass
         try:
-            os.chown(target_root, current_uid, staff_gid)
-            os.chown(runtime_root(), current_uid, staff_gid)
+            os.chown(target_root, target_uid, target_gid)
+            os.chown(self._runtime_root(), target_uid, target_gid)
         except OSError:
             pass
 
     def _bootout_commands(self) -> list[list[str]]:
         return [
-            [LAUNCHCTL_BIN, "bootout", f"{launchctl_target()}/{LAUNCH_AGENT_LABEL}"],
-            [LAUNCHCTL_BIN, "bootout", launchctl_target(), str(self.paths.plist_path)],
+            [LAUNCHCTL_BIN, "bootout", f"{self._launchctl_target()}/{LAUNCH_AGENT_LABEL}"],
+            [LAUNCHCTL_BIN, "bootout", self._launchctl_target(), str(self.paths.plist_path)],
         ]
 
     def _bootout_tolerate(self) -> set[str]:

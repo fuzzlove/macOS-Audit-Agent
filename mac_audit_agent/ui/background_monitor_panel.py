@@ -8,6 +8,7 @@ import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -34,14 +35,17 @@ from mac_audit_agent.monitor import (
     HEARTBEAT_SECONDS,
     STDERR_MONITOR_LOG,
     append_monitor_log_line,
-    clear_monitor_log_files,
     is_heartbeat_fresh,
     is_pid_alive,
     tail_text_file,
+    truncate_monitor_log_file,
 )
 from mac_audit_agent.notification_manager import NotificationManager
 from mac_audit_agent.reporting import export_monitor_events_html, export_monitor_events_json, get_reports_dir
 from mac_audit_agent.storage import AuditDatabase
+from mac_audit_agent.ui.context_dialog import ContextDialog
+from mac_audit_agent.ui.provenance_dialog import AlertProvenanceDialog
+from mac_audit_agent.workflow_layer import InvestigatorWorkflowLayer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +59,9 @@ EVENT_TYPES = [
     "capture_capable_process_closed",
     "capture_process_observed",
     "suspicious_process_observed",
+    "launchdaemon_added",
+    "launchagent_added",
+    "persistence_item_created_high_risk",
     "screen_wake",
     "screen_sleep",
     "display_sleep",
@@ -79,6 +86,10 @@ EVENT_TYPES = [
     "new_admin_user_detected",
     "packet_capture_started",
     "packet_capture_completed",
+    "usb_device_connected",
+    "system_moisture_detected",
+    "network_ip_assigned",
+    "vpn_connected",
     "major_security_event",
     "monitor_self_test",
     "monitor_test_event",
@@ -92,6 +103,8 @@ class BackgroundMonitorPanel(QWidget):
         self.launch_agent = launch_agent
         self.service = BackgroundMonitorService(self.db.path, record_startup=False)
         self.notifications = NotificationManager(self.db)
+        self.workflow_layer = InvestigatorWorkflowLayer(self.db)
+        self.current_events: list = []
         self._build_ui()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh)
@@ -216,8 +229,22 @@ class BackgroundMonitorPanel(QWidget):
 
         self.events_table = QTableWidget(0, 7)
         self.events_table.setHorizontalHeaderLabels(["Timestamp", "Type", "Severity", "Source", "Process", "Confidence", "Evidence"])
+        self.events_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.events_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.events_table.itemSelectionChanged.connect(self._update_selected_event_context_state)
         self.events_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.events_table)
+        event_context_row = QHBoxLayout()
+        self.show_context_button = QPushButton("Show Context")
+        self.show_context_button.setEnabled(False)
+        self.show_context_button.clicked.connect(self.show_selected_event_context)
+        self.show_provenance_button = QPushButton("Why did this alert fire?")
+        self.show_provenance_button.setEnabled(False)
+        self.show_provenance_button.clicked.connect(self.show_selected_event_provenance)
+        event_context_row.addWidget(self.show_context_button)
+        event_context_row.addWidget(self.show_provenance_button)
+        event_context_row.addStretch(1)
+        layout.addLayout(event_context_row)
 
         layout.addWidget(QLabel("Show Monitor Health"))
         self.health_panel = QTextEdit()
@@ -321,6 +348,7 @@ class BackgroundMonitorPanel(QWidget):
                     f"Detector enabled session: {'yes' if db_status.detector_enabled_session else 'no'}",
                     f"Detector enabled sharing: {'yes' if db_status.detector_enabled_sharing else 'no'}",
                     f"Detector enabled process: {'yes' if db_status.detector_enabled_process else 'no'}",
+                    f"Detector enabled hardware: {'yes' if db_status.detector_enabled_hardware else 'no'}",
                     f"Detector last zero reason: {db_status.detector_last_zero_reason or 'none'}",
                     f"Current snapshot: {db_status.current_snapshot or '{}'}",
                     f"Current snapshot keys: {', '.join(sorted(json.loads(db_status.current_snapshot or '{}').keys())) if db_status.current_snapshot else 'none'}",
@@ -328,6 +356,8 @@ class BackgroundMonitorPanel(QWidget):
                     f"Suppressed popup count: {self._suppressed_popup_count()}",
                     f"Last notification decision: {self._last_notification_decision()}",
                     f"Notification permission/status: {db_status.notification_status or self.notifications.status()}",
+                    f"CFAA acknowledgment: {self.db.get_background_monitor_state('cfaa_acknowledgment_status', 'not started')}",
+                    f"Security overlay: {self.db.get_background_monitor_state('security_overlay_status', 'inactive')}",
                     f"Current launchctl domain: {launch_status.current_launchctl_domain or db_status.current_launchctl_domain or 'unknown'}",
                     f"Log path: {self._fallback_log_path_text()}",
                     f"Fallback log path: {self._fallback_log_path_text()}",
@@ -367,6 +397,7 @@ class BackgroundMonitorPanel(QWidget):
     def refresh_events(self) -> None:
         event_type = str(self.filter_combo.currentData() or "")
         events = self.db.latest_monitor_events(limit=200) if not event_type else self.db.recent_background_monitor_events(limit=200, event_type=event_type)
+        self.current_events = list(events)
         self.events_table.setRowCount(0)
         if not events:
             self.events_table.setRowCount(1)
@@ -391,6 +422,85 @@ class BackgroundMonitorPanel(QWidget):
             ):
                 self.events_table.setItem(row, column, QTableWidgetItem(str(value)))
         self.events_table.resizeRowsToContents()
+        self._update_selected_event_context_state()
+
+    def _selected_event(self):
+        if not hasattr(self, "events_table"):
+            return None
+        selected = self.events_table.selectedItems()
+        if not selected:
+            return None
+        row = selected[0].row()
+        if row < 0 or row >= len(self.current_events):
+            return None
+        return self.current_events[row]
+
+    def _update_selected_event_context_state(self) -> None:
+        if not hasattr(self, "show_context_button"):
+            return
+        enabled = self._selected_event() is not None
+        self.show_context_button.setEnabled(enabled)
+        if hasattr(self, "show_provenance_button"):
+            self.show_provenance_button.setEnabled(enabled)
+
+    def show_selected_event_context(self) -> None:
+        event = self._selected_event()
+        if event is None:
+            QMessageBox.information(self, "No Event", "Select an event first.")
+            return
+        window = self.workflow_layer.build_context_window(
+            event.timestamp,
+            focus_label=event.event_type,
+            focus_kind="monitor",
+            focus_category="monitor",
+            focus_id=event.event_id,
+            focus_event_id=event.event_id,
+        )
+        ContextDialog(window, self).exec()
+
+    def _selected_event_provenance_text(self, event) -> str:
+        hints = event.false_positive_hints or []
+        steps = event.recommended_verification_steps or []
+        lines = [
+            f"Alert: {event.event_type}",
+            f"Rule: {event.rule_id or event.trigger_rule_id} ({event.rule_name or event.trigger_rule_name})",
+            f"Detector: {event.trigger_source or event.source} / {event.trigger_subsource or event.source}",
+            f"Confidence: {event.confidence}",
+            f"Evidence: {event.evidence}",
+            f"Previous state: {event.previous_state}",
+            f"Current state: {event.current_state}",
+            f"First seen: {event.first_seen or event.timestamp}",
+            f"Last seen: {event.last_seen or event.timestamp}",
+            f"Correlation: {event.correlation_id}",
+            f"Baseline: {event.baseline_status}",
+            f"Possible false-positive reason: {', '.join(str(item) for item in hints) if hints else event.suppression_reason}",
+            f"Verification: {', '.join(str(item) for item in steps) if steps else event.recommendation}",
+        ]
+        if event.raw_signal_summary:
+            lines.append(f"Raw signal: {event.raw_signal_summary}")
+        if event.normalized_signal:
+            lines.append(f"Normalized signal: {event.normalized_signal}")
+        if event.source_trace:
+            lines.append(f"Source trace: {event.source_trace}")
+        if event.evidence_hash:
+            lines.append(f"Evidence hash: {event.evidence_hash}")
+        return "\n".join(line for line in lines if line)
+
+    def show_selected_event_provenance(self) -> None:
+        event = self._selected_event()
+        if event is None:
+            QMessageBox.information(self, "No Event", "Select an event first.")
+            return
+        window = self.workflow_layer.build_context_window(
+            event.timestamp,
+            focus_label=event.event_type,
+            focus_kind="monitor",
+            focus_category="monitor",
+            focus_id=event.event_id,
+            focus_event_id=event.event_id,
+        ).to_dict()
+        body = self._selected_event_provenance_text(event)
+        AlertProvenanceDialog("Alert Provenance", body, window, self).exec()
 
     def install_monitor(self) -> None:
         if QMessageBox.question(self, "Install Background Monitor", DISCLAIMER) != QMessageBox.StandardButton.Yes:
@@ -747,7 +857,8 @@ class BackgroundMonitorPanel(QWidget):
         clear_db = selection["clear_event_history"]
         try:
             self._write_app_log(f"user triggered monitor log clear | clear_event_history={clear_db}")
-            clear_monitor_log_files()
+            for path in self._monitor_log_paths():
+                truncate_monitor_log_file(path)
             removed = 0
             if clear_db:
                 removed = self.db.clear_monitor_events()

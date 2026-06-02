@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import subprocess
 import json
+import hashlib
+import os
+import re
+import time
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +32,8 @@ IMPORTANT_EVENT_TYPES = {
     "lid_closed",
     "lid_opened",
     "screen_sharing_enabled",
+    "system_moisture_detected",
+    "new_usb_device_detected",
     "remote_login_enabled",
     "suspicious_process_observed",
     "persistence_item_created",
@@ -53,10 +60,12 @@ CRITICAL_POPUP_ALLOWLIST = {
     "launchagent_added_high_risk",
     "launchagent_removed_high_risk",
     "persistence_item_created_high_risk",
+    "alert_storm_detected",
     "hidden_localhost_port_detected",
     "suspicious_root_process_observed",
     "remote_login_enabled",
     "screen_sharing_enabled",
+    "system_moisture_detected",
 }
 BROWSER_HELPER_KEYWORDS = {
     "operahelper",
@@ -77,6 +86,7 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "hidden_localhost_port_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
     "suspicious_root_process_observed": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
     "launchdaemon_added": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
+    "alert_storm_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
     "camera_activity_confirmed": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
     "capture_capable_process_observed": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
     "possible_lid_opened": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 600, "notification_mode": "dialog"},
@@ -95,11 +105,29 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "screen_locked": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
     "screen_locked_state_changed": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
     "file_sharing_enabled": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
-    "usb_device_connected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
+    "input_activity_resumed_after_idle": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
+    "usb_device_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "new_usb_device_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 0, "notification_mode": "both"},
+    "system_moisture_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "notification"},
+    "network_ip_assigned": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "vpn_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
     "bluetooth_device_connected": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
     "capture_capable_process_closed": {"enabled": True, "severity": "medium", "notify": False, "cooldown_seconds": 0, "notification_mode": "none"},
 }
 FALLBACK_MONITOR_LOG = Path.home() / "Library" / "Logs" / "MacAuditAgent" / "monitor.log"
+CFAA_ACK_RETRY_SECONDS = 300
+CFAA_ACK_ASID_RE = re.compile(r"\basid\s*=\s*(\d+)\b")
+CFAA_ACK_MESSAGE = (
+    "Authorized use reminder\n\n"
+    "Use this computer and its connected systems only with authorization. "
+    "Unauthorized access or exceeding authorized access may violate policy and applicable law, "
+    "including the Computer Fraud and Abuse Act, 18 U.S.C. 1030.\n\n"
+    "Security indicators are logged locally. This reminder is not legal advice or a legal determination.\n\n"
+    "Click Acknowledge to confirm that you understand this authorized-use reminder."
+)
+OVERLAY_SEVERITIES = {"info", "medium", "high", "critical"}
+OVERLAY_STATE_PATH = Path.home() / ".mac_audit_agent" / "state" / "security_overlay.json"
+OVERLAY_PID_PATH = Path.home() / ".mac_audit_agent" / "state" / "security_overlay.pid"
 
 
 def applescript_escape(value: str) -> str:
@@ -110,9 +138,10 @@ def send_notification(title, subtitle, message, sound="Glass", runner=None):
     script = (
         f'display notification "{applescript_escape(message)}" '
         f'with title "{applescript_escape(title)}" '
-        f'subtitle "{applescript_escape(subtitle)}" '
-        f'sound name "{applescript_escape(sound)}"'
+        f'subtitle "{applescript_escape(subtitle)}"'
     )
+    if sound:
+        script += f' sound name "{applescript_escape(sound)}"'
     runner = runner or subprocess.run
     return runner([OSASCRIPT_BIN, "-e", script], timeout=5, capture_output=True, text=True, env=NOTIFICATION_PATH_ENV)
 
@@ -128,9 +157,13 @@ def send_alert_dialog(title, message, runner=None):
 
 
 class NotificationManager:
-    def __init__(self, db, runner=None) -> None:
+    def __init__(self, db, runner=None, popen_factory=None) -> None:
         self.db = db
         self.runner = runner or subprocess.run
+        self.popen_factory = popen_factory or subprocess.Popen
+        self._cfaa_ack_process = None
+        self._cfaa_ack_session_key = ""
+        self._cfaa_ack_last_attempt = 0.0
 
     def settings(self) -> dict[str, object]:
         raw_preferences = self.db.get_background_monitor_state("event_preferences_json", "")
@@ -200,6 +233,65 @@ class NotificationManager:
     def status(self) -> str:
         return "available via AppleScript" if Path("/usr/bin/osascript").exists() else "unavailable"
 
+    def start_cfaa_login_acknowledgment(self) -> bool:
+        self.poll_cfaa_login_acknowledgment()
+        session_key = self._gui_session_key()
+        if not session_key:
+            self.db.set_background_monitor_state("cfaa_acknowledgment_status", "unavailable: GUI session identifier not found")
+            return False
+        if self.db.get_background_monitor_state("cfaa_acknowledged_session", "") == session_key:
+            self.db.set_background_monitor_state("cfaa_acknowledgment_status", f"acknowledged for {session_key}")
+            return False
+        if self._cfaa_ack_process is not None and self._cfaa_ack_process.poll() is None:
+            return False
+        if self._cfaa_ack_last_attempt and time.monotonic() - self._cfaa_ack_last_attempt < CFAA_ACK_RETRY_SECONDS:
+            return False
+        script = (
+            f'display dialog "{applescript_escape(CFAA_ACK_MESSAGE)}" '
+            f'with title "{applescript_escape("Mac Audit Agent - Authorized Use Acknowledgment")}" '
+            'buttons {"Acknowledge"} default button "Acknowledge" with icon caution'
+        )
+        self._cfaa_ack_session_key = session_key
+        self._cfaa_ack_last_attempt = time.monotonic()
+        self._cfaa_ack_process = self.popen_factory(
+            [OSASCRIPT_BIN, "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=NOTIFICATION_PATH_ENV,
+        )
+        self.db.set_background_monitor_state("cfaa_acknowledgment_status", f"pending for {session_key}")
+        return True
+
+    def poll_cfaa_login_acknowledgment(self) -> bool:
+        if self._cfaa_ack_process is None:
+            return False
+        returncode = self._cfaa_ack_process.poll()
+        if returncode is None:
+            return False
+        session_key = self._cfaa_ack_session_key
+        self._cfaa_ack_process = None
+        if returncode == 0 and session_key:
+            self.db.set_background_monitor_state("cfaa_acknowledged_session", session_key)
+            self.db.set_background_monitor_state("cfaa_acknowledged_at", datetime.now().astimezone().isoformat())
+            self.db.set_background_monitor_state("cfaa_acknowledgment_status", f"acknowledged for {session_key}")
+            return True
+        self.db.set_background_monitor_state("cfaa_acknowledgment_status", f"not acknowledged for {session_key or 'unknown session'}")
+        return False
+
+    def _gui_session_key(self) -> str:
+        result = self.runner(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}"],
+            timeout=5,
+            capture_output=True,
+            text=True,
+            env=NOTIFICATION_PATH_ENV,
+        )
+        if getattr(result, "returncode", 1) != 0:
+            return ""
+        match = CFAA_ACK_ASID_RE.search(getattr(result, "stdout", "") or "")
+        return f"gui/{os.getuid()}:asid/{match.group(1)}" if match else ""
+
     def should_notify(self, event: BackgroundMonitorEvent, *, force: bool = False) -> bool:
         decision = self.evaluate_notification_decision(event, force=force)
         return decision["notify"] and decision["decision"] == "sent"
@@ -220,16 +312,22 @@ class NotificationManager:
         explicit_preference = event.event_type in explicit_preferences
         severity = str(preference.get("severity", event.severity))
         event.severity = severity
+        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
+            return False, "missing rule_id"
         if not preference.get("enabled", True):
             return False, "disabled_by_user"
         if self._is_browser_helper_process(event) and not settings.get("browser_capture_process_popup", False):
             return False, "browser helper process logged silently"
+        if event.event_type in DEFAULT_EVENT_PREFERENCES and preference.get("notify", False) and preference.get("notification_mode", "none") != "none":
+            return True, "default event preference popup enabled"
         if explicit_preference and (
             not preference.get("notify", False) or str(preference.get("notification_mode", "none")) == "none"
         ):
             return False, "disabled_by_user"
         if explicit_preference and preference.get("notify", False) and preference.get("notification_mode", "none") != "none":
             return True, "user preference popup enabled"
+        if event.event_type == "usb_device_connected" and preference.get("notify", False):
+            return True, "USB recognition sound enabled"
         if event.event_type not in CRITICAL_POPUP_ALLOWLIST:
             return False, "event type is log-only by default"
         if severity not in {"high", "critical"}:
@@ -238,12 +336,86 @@ class NotificationManager:
             return True, "critical popup allowlist match"
         return bool(preference.get("notify", False)), "user popup policy override"
 
+    def notify_findings_digest(self, findings: list[object]) -> tuple[bool, str]:
+        normalized = [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in findings]
+        if not normalized:
+            return False, "no findings"
+        severity_order = ["critical", "high", "medium", "low", "info"]
+        counts = {severity: sum(1 for item in normalized if str(item.get("severity", "info")) == severity) for severity in severity_order}
+        identifiers = sorted(
+            str(cve_id)
+            for item in normalized
+            for cve_id in (item.get("cve_ids", []) or [item.get("title", "")])
+            if cve_id
+        )
+        fingerprint = hashlib.sha256("\n".join(identifiers).encode("utf-8")).hexdigest()
+        if self.db.get_background_monitor_state("cfaa_findings_digest_fingerprint", "") == fingerprint:
+            return False, "unchanged findings digest"
+        summary = ", ".join(f"{count} {severity}" for severity, count in counts.items() if count) or f"{len(normalized)} findings"
+        message = (
+            f"Local review recorded {summary} indicators. Authorized use only. Activity is logged. "
+            "Unauthorized access may violate policy and applicable law, including 18 U.S.C. 1030. "
+            "This notice is not a legal determination."
+        )
+        sound = "Glass" if counts["critical"] or counts["high"] else ""
+        result = send_notification("Mac Audit Agent", "Security Activity Summary", message, sound=sound, runner=self.runner)
+        if getattr(result, "returncode", 1) != 0:
+            detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "notification failed").strip()
+            return False, detail
+        self.db.set_background_monitor_state("cfaa_findings_digest_fingerprint", fingerprint)
+        return True, ""
+
+    def notify_cfaa_idle_reminder(self, event: BackgroundMonitorEvent) -> tuple[bool, str]:
+        command, result = self._run_dialog_attempt(CFAA_ACK_MESSAGE)
+        self._log_attempt(event, str(event.severity), command, result, getattr(result, "returncode", 1) == 0)
+        if getattr(result, "returncode", 1) == 0:
+            event.notification_sent = True
+            event.notification_error = ""
+            event.notification_returncode = 0
+            event.notification_decision = "sent"
+            event.notification_reason = "cfaa_idle_reminder"
+            event.popup_allowed = True
+            self.db.set_background_monitor_state("cfaa_idle_reminder_at", datetime.now().astimezone().isoformat())
+            self.db.set_background_monitor_state("notification_status", self.status())
+            return True, ""
+        detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "notification failed").strip()
+        event.notification_sent = False
+        event.notification_error = detail
+        event.notification_returncode = getattr(result, "returncode", None)
+        self.db.set_background_monitor_state("notification_status", f"failed: {detail}")
+        self.db.set_background_monitor_state("last_error", f"Notification failed for {event.event_type}: {detail}")
+        self._write_fallback_log(f"notification error: type={event.event_type} detail={detail}")
+        return False, detail
+
     def evaluate_notification_decision(self, event: BackgroundMonitorEvent, *, force: bool = False) -> dict[str, object]:
         settings = self.settings()
         preference = self.preference_for(event.event_type)
         explicit_preference = event.event_type in dict(settings.get("event_preferences", {}))
         effective_severity = str(preference.get("severity", event.severity))
         event.severity = effective_severity
+        if not (getattr(event, "rule_id", "") or getattr(event, "trigger_rule_id", "")):
+            event.notification_decision = "invalid_incomplete"
+            event.notification_reason = "missing_rule_id"
+            event.popup_allowed = False
+            decision = {
+                "event_type": event.event_type,
+                "severity": effective_severity,
+                "priority": effective_severity,
+                "user_preference_loaded": explicit_preference,
+                "notify": False,
+                "alert_style": preference.get("notification_mode", "none"),
+                "cooldown_suppressed": False,
+                "cooldown_remaining_seconds": 0,
+                "decision": "invalid_incomplete",
+                "reason": "missing_rule_id",
+                "command": "",
+                "returncode": "",
+                "stderr": "",
+                "notification_sent": False,
+                "popup_allowed": False,
+            }
+            self._write_decision(decision)
+            return decision
         decision = {
             "event_type": event.event_type,
             "severity": effective_severity,
@@ -295,7 +467,8 @@ class NotificationManager:
             self._write_decision(decision)
             return decision
         min_level = SEVERITY_LEVELS.get(str(settings["notify_min_severity"]), 0)
-        if SEVERITY_LEVELS.get(effective_severity, 0) < min_level:
+        allow_default_info = event.event_type in DEFAULT_EVENT_PREFERENCES and preference.get("notify", False) and preference.get("notification_mode", "none") != "none"
+        if SEVERITY_LEVELS.get(effective_severity, 0) < min_level and not allow_default_info:
             event.notification_decision = "log_only"
             event.notification_reason = "below_min_severity"
             event.cooldown_remaining_seconds = 0
@@ -353,6 +526,9 @@ class NotificationManager:
         return decision
 
     def notify(self, event: BackgroundMonitorEvent, *, force: bool = False) -> tuple[bool, str]:
+        if event.event_type == "input_activity_resumed_after_idle":
+            self.update_security_overlay(event)
+            return self.notify_cfaa_idle_reminder(event)
         settings = self.settings()
         preference = self.preference_for(event.event_type)
         message = self._message(event)
@@ -360,12 +536,13 @@ class NotificationManager:
         priority = str(preference.get("severity", event.severity))
         notification_mode = str(preference.get("notification_mode", settings.get("notification_mode", "notification")))
         attempts: list[tuple[list[str], object]] = []
+        self.update_security_overlay(event)
         if notification_mode in {"notification", "both"}:
             script = (
                 f'display notification "{applescript_escape(message)}" '
                 f'with title "{applescript_escape("Mac Audit Agent")}" '
                 f'subtitle "{applescript_escape(subtitle)}" '
-                f'sound name "{applescript_escape(str(settings["notification_sound"]))}"'
+                f'sound name "{applescript_escape(self._sound_for(event, settings))}"'
             )
             command = [OSASCRIPT_BIN, "-e", script]
             result = self.runner(command, timeout=5, capture_output=True, text=True, env=NOTIFICATION_PATH_ENV)
@@ -405,13 +582,91 @@ class NotificationManager:
         self._write_fallback_log(f"notification error: type={event.event_type} detail={detail}")
         return False, detail
 
+    def update_security_overlay(self, event: BackgroundMonitorEvent) -> bool:
+        if self.db.get_background_monitor_state("security_overlay_enabled", "0") != "1":
+            return False
+        if event.severity not in OVERLAY_SEVERITIES:
+            return False
+        state_path = OVERLAY_STATE_PATH
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        previous = {}
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        same_type = previous.get("active", False) and previous.get("event_type") == event.event_type
+        summary = event.evidence.strip().replace("\n", " ")
+        payload = {
+            "active": True,
+            "event_type": event.event_type,
+            "severity": event.severity,
+            "summary": summary[:240] + ("..." if len(summary) > 240 else ""),
+            "timestamp": event.timestamp,
+            "count": int(previous.get("count", 0) or 0) + 1 if same_type else 1,
+        }
+        temporary = state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(state_path)
+        self.db.set_background_monitor_state("security_overlay_status", f"active: {event.event_type}")
+        self._ensure_security_overlay_process()
+        return True
+
+    def reconcile_security_overlay(self) -> bool:
+        if self.db.get_background_monitor_state("security_overlay_enabled", "0") != "1":
+            return False
+        try:
+            payload = json.loads(OVERLAY_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            self.db.set_background_monitor_state("security_overlay_status", "inactive")
+            return False
+        if not payload.get("active", False):
+            self.db.set_background_monitor_state("security_overlay_status", "inactive")
+            return False
+        self.db.set_background_monitor_state("security_overlay_status", f"active: {payload.get('event_type', 'security_event')}")
+        self._ensure_security_overlay_process()
+        return True
+
+    def _ensure_security_overlay_process(self) -> None:
+        if self._security_overlay_pid_alive():
+            return
+        script_path = Path(__file__).resolve().parent / "security_overlay.py"
+        process = self.popen_factory(
+            [sys.executable, str(script_path), "--state-path", str(OVERLAY_STATE_PATH)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env={**os.environ, **NOTIFICATION_PATH_ENV},
+        )
+        OVERLAY_PID_PATH.write_text(str(process.pid), encoding="utf-8")
+
+    def _security_overlay_pid_alive(self) -> bool:
+        try:
+            pid = int(OVERLAY_PID_PATH.read_text(encoding="utf-8").strip())
+            os.kill(pid, 0)
+            return True
+        except (OSError, ValueError):
+            return False
+
     def _last_key(self, event: BackgroundMonitorEvent) -> str:
         return f"notify:{event.event_type}:{event.process_name}:{event.evidence[:64]}"
 
     def _message(self, event: BackgroundMonitorEvent) -> str:
         evidence = event.evidence.strip().replace("\n", " ")
         evidence = evidence[:120] + ("..." if len(evidence) > 120 else "")
-        return f"{event.event_type} | {event.severity} | {evidence} | confidence={event.confidence}"
+        return (
+            f"{event.event_type} | {event.severity} | {evidence} | confidence={event.confidence}. "
+            "Authorized use only. Activity is logged. Unauthorized access may violate policy and applicable law, "
+            "including 18 U.S.C. 1030. This indicator is not a legal determination."
+        )
+
+    def _sound_for(self, event: BackgroundMonitorEvent, settings: dict[str, object]) -> str:
+        if event.event_type in {"network_ip_assigned", "vpn_connected"}:
+            return ""
+        if event.event_type in {"usb_device_connected", "new_usb_device_detected"}:
+            return self.db.get_background_monitor_state("usb_recognition_sound", "Pop") or "Pop"
+        if event.event_type == "system_moisture_detected":
+            return self.db.get_background_monitor_state("moisture_detection_sound", "Basso") or "Basso"
+        return str(settings["notification_sound"])
 
     def _write_fallback_log(self, message: str) -> None:
         try:

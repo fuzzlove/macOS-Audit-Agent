@@ -1,6 +1,7 @@
 import json
 import re
 import ipaddress
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -474,3 +475,18 @@ def test_record_finding_does_not_crash_on_extra_fields(tmp_path: Path) -> None:
 
     assert row is not None
     assert row["title"] == "Extra finding"
+
+
+def test_storage_migration_preserves_existing_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "audit.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE legacy_table (id TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT INTO legacy_table (id, value) VALUES (?, ?)", ("one", "preserve-me"))
+    conn.commit()
+    conn.close()
+
+    db = AuditDatabase(db_path, tmp_path / "logs")
+    row = db.conn.execute("SELECT value FROM legacy_table WHERE id = ?", ("one",)).fetchone()
+    assert row is not None
+    assert row["value"] == "preserve-me"
+    assert db.conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'apple_security_forecasts'").fetchone() is not None
