@@ -316,3 +316,5 @@ The app currently includes:
 - baseline drift detection
 - report branding with logo assets
 - JSON and HTML export paths for scans, monitor events, and notes
+
+![](https://seeyoufarm.com)
