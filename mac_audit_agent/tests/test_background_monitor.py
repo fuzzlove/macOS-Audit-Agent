@@ -1719,6 +1719,63 @@ def test_hardware_monitor_parses_only_connected_bluetooth_devices() -> None:
     assert devices == [{"name": "Research Keyboard", "address": "AA-BB-CC-DD-EE-FF", "vendor_id": "", "product_id": ""}]
 
 
+def test_hardware_monitor_parses_system_profiler_connected_bluetooth_devices() -> None:
+    monitor = HardwareMonitor()
+    devices = monitor._parse_system_profiler_bluetooth_devices(
+        json.dumps(
+            {
+                "SPBluetoothDataType": [
+                    {
+                        "device_connected": [
+                            {
+                                "_name": "Research Keyboard",
+                                "device_address": "AA-BB-CC",
+                                "device_vendorID": "76",
+                                "device_productID": "612",
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+    )
+
+    assert devices == [
+        {
+            "name": "Research Keyboard",
+            "address": "AA-BB-CC",
+            "vendor_id": "76",
+            "product_id": "612",
+        }
+    ]
+
+
+def test_hardware_monitor_merges_ioreg_and_system_profiler_bluetooth_sources() -> None:
+    def executor(command):
+        if command[:3] == ["/usr/sbin/ioreg", "-r", "-c"]:
+            return (
+                0,
+                """
++-o Keyboard <class IOBluetoothDevice, id 0x1>
+    "Name" = "Keyboard"
+    "DeviceAddress" = "AA-BB"
+    "Connected" = Yes
+""",
+                "",
+            )
+        if command[:2] == ["/usr/sbin/system_profiler", "SPBluetoothDataType"]:
+            return (
+                0,
+                json.dumps({"SPBluetoothDataType": [{"device_connected": [{"_name": "Keyboard", "device_address": "AA-BB"}]}]}),
+                "",
+            )
+        return 1, "", ""
+
+    devices = HardwareMonitor(executor=executor).collect_bluetooth_devices()
+
+    assert devices == [{"name": "Keyboard", "address": "AA-BB", "vendor_id": "", "product_id": ""}]
+
+
 def test_hardware_monitor_emits_connected_bluetooth_event_with_provenance() -> None:
     monitor = HardwareMonitor()
     current = HardwareMonitorSnapshot(bluetooth_devices=[{"name": "Research Mouse", "address": "AA-BB"}])
@@ -1920,14 +1977,131 @@ def test_network_monitor_detects_ip_assignment_and_vpn_connection() -> None:
         "new_outbound_connection_detected",
         "vpn_connected",
     ]
-    assert events[0].severity == "info"
+    assert events[0].severity == "medium"
     assert "192.168.1.20" in events[0].evidence
     assert events[1].severity == "high"
     assert "192.168.1.20" in events[1].evidence
     assert events[2].severity == "high"
     assert "192.168.1.20" in events[2].evidence
-    assert events[3].severity == "info"
+    assert events[3].severity == "medium"
     assert "utun3" in events[3].evidence
+
+
+def test_network_monitor_detects_new_active_interfaces_gateway_and_dns() -> None:
+    monitor = NetworkMonitor()
+    previous = NetworkMonitorSnapshot(
+        interface="en0",
+        ip_address="192.168.1.10",
+        netmask="255.255.255.0",
+        gateway="192.168.1.1",
+        subnet="192.168.1.0/24",
+        scope="private",
+        active_interfaces=[
+            {"interface": "en0", "kind": "ethernet_or_wifi", "ip_address": "192.168.1.10", "netmask": "255.255.255.0", "broadcast": "192.168.1.255"},
+        ],
+        dns_servers=["192.168.1.1"],
+        vpn_interfaces=[],
+    )
+    current = NetworkMonitorSnapshot(
+        interface="en5",
+        ip_address="10.20.30.40",
+        netmask="255.255.255.0",
+        gateway="10.20.30.1",
+        subnet="10.20.30.0/24",
+        scope="private",
+        active_interfaces=[
+            {"interface": "en0", "kind": "ethernet_or_wifi", "ip_address": "192.168.1.10", "netmask": "255.255.255.0", "broadcast": "192.168.1.255"},
+            {"interface": "en5", "kind": "ethernet_or_wifi", "ip_address": "10.20.30.40", "netmask": "255.255.255.0", "broadcast": "10.20.30.255"},
+            {"interface": "utun4", "kind": "vpn", "ip_address": "10.8.0.2", "netmask": "255.255.255.255", "broadcast": ""},
+        ],
+        dns_servers=["10.20.30.53", "10.20.30.54"],
+        vpn_interfaces=[{"interface": "utun4", "kind": "vpn", "ip_address": "10.8.0.2", "netmask": "255.255.255.255", "broadcast": ""}],
+    )
+
+    events = monitor.evaluate(previous, current)
+    event_types = [event.event_type for event in events]
+
+    assert "network_interface_connected" in event_types
+    assert "new_network_connection_detected" in event_types
+    assert "new_gateway_detected" in event_types
+    assert "new_dns_server_detected" in event_types
+    assert "vpn_connected" in event_types
+    interface_events = [event for event in events if event.event_type == "network_interface_connected"]
+    assert {event.severity for event in interface_events} == {"medium"}
+    assert any("en5" in event.evidence for event in interface_events)
+    assert any("utun4" in event.evidence for event in interface_events)
+
+
+def test_network_monitor_detects_wifi_ssid_change_as_high_connection_event() -> None:
+    monitor = NetworkMonitor()
+    previous = NetworkMonitorSnapshot(
+        interface="en0",
+        ip_address="192.168.1.10",
+        gateway="192.168.1.1",
+        subnet="192.168.1.0/24",
+        scope="private",
+        wifi_ssid="ResearchLab",
+    )
+    current = NetworkMonitorSnapshot(
+        interface="en0",
+        ip_address="192.168.1.10",
+        gateway="192.168.1.1",
+        subnet="192.168.1.0/24",
+        scope="private",
+        wifi_ssid="VisitorNetwork",
+    )
+
+    events = monitor.evaluate(previous, current)
+    wifi_events = [event for event in events if event.event_type == "new_network_connection_detected"]
+
+    assert len(wifi_events) == 1
+    assert wifi_events[0].severity == "high"
+    assert "VisitorNetwork" in wifi_events[0].evidence
+
+
+def test_medium_network_interface_event_triggers_visible_overlay(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "security_overlay.pid")
+    manager = NotificationManager(AuditDatabase(tmp_path / "audit.sqlite"))
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="iface-overlay",
+        timestamp=utc_now_iso(),
+        event_type="network_interface_connected",
+        severity="medium",
+        source="network_state_observer",
+        evidence="Network interface connected: en5 assigned 10.20.30.40.",
+        confidence="high",
+    )
+
+    assert manager.update_security_overlay(event) is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["event_type"] == "network_interface_connected"
+    assert payload["style"] in {"neutral_grey", "high_orange"}
+    assert event.visible_alert_shown is True
+
+
+def test_bluetooth_connection_event_triggers_visible_overlay(tmp_path: Path, monkeypatch) -> None:
+    state_path = tmp_path / "security_overlay.json"
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_STATE_PATH", state_path)
+    monkeypatch.setattr("mac_audit_agent.notification_manager.OVERLAY_PID_PATH", tmp_path / "security_overlay.pid")
+    manager = NotificationManager(AuditDatabase(tmp_path / "audit.sqlite"))
+    monkeypatch.setattr(manager, "_ensure_security_overlay_process", lambda: True)
+    event = BackgroundMonitorEvent(
+        event_id="bt-overlay",
+        timestamp=utc_now_iso(),
+        event_type="bluetooth_device_connected",
+        severity="medium",
+        source="ioreg_bluetooth_observer",
+        evidence="Bluetooth device connected: Security Keyboard.",
+        confidence="high",
+    )
+
+    assert manager.update_security_overlay(event) is True
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert payload["event_type"] == "bluetooth_device_connected"
+    assert payload["style"] == "high_orange"
 
 
 def test_new_network_connection_event_is_visible_by_default(tmp_path: Path) -> None:
@@ -4772,3 +4946,56 @@ def test_system_daemon_periodic_integrity_drift_records_one_tamper_event(tmp_pat
     assert [event.event_type for event in first] == ["protected_monitor_tamper_detected"]
     assert second == []
     assert service.db.latest_monitor_events(limit=1)[0].severity == "critical"
+
+
+def test_monitor_log_integrity_accepts_append_only_and_alerts_on_rewrite(tmp_path: Path, monkeypatch) -> None:
+    fallback_log = tmp_path / "monitor.log"
+    stdout_log = tmp_path / "background_monitor.stdout.log"
+    stderr_log = tmp_path / "background_monitor.stderr.log"
+    fallback_log.write_text("first line\n", encoding="utf-8")
+    stdout_log.write_text("stdout line\n", encoding="utf-8")
+    stderr_log.write_text("stderr line\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.monitor.FALLBACK_MONITOR_LOG", fallback_log)
+    monkeypatch.setattr("mac_audit_agent.monitor.STDOUT_MONITOR_LOG", stdout_log)
+    monkeypatch.setattr("mac_audit_agent.monitor.STDERR_MONITOR_LOG", stderr_log)
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(service.notifications, "notify", lambda event, force=False: (True, ""))
+
+    assert service._run_integrity_detector() == []
+    first_chain = service.db.get_background_monitor_state("monitor_log_integrity_chain_head", "")
+    fallback_log.write_text("first line\nappend line\n", encoding="utf-8")
+    service._last_integrity_poll = 0
+    assert service._run_integrity_detector() == []
+    second_chain = service.db.get_background_monitor_state("monitor_log_integrity_chain_head", "")
+    assert second_chain and second_chain != first_chain
+
+    fallback_log.write_text("tampered first line\nappend line\n", encoding="utf-8")
+    service._last_integrity_poll = 0
+    events = service._run_integrity_detector()
+
+    assert [event.event_type for event in events] == ["protected_monitor_tamper_detected"]
+    assert events[0].severity == "critical"
+    assert "earlier bytes changed" in events[0].evidence or "content changed in place" in events[0].evidence
+    assert str(fallback_log) in events[0].related_path
+
+
+def test_monitor_log_integrity_alerts_on_deleted_log_and_recreates(tmp_path: Path, monkeypatch) -> None:
+    fallback_log = tmp_path / "monitor.log"
+    stdout_log = tmp_path / "background_monitor.stdout.log"
+    stderr_log = tmp_path / "background_monitor.stderr.log"
+    for path in [fallback_log, stdout_log, stderr_log]:
+        path.write_text("line\n", encoding="utf-8")
+    monkeypatch.setattr("mac_audit_agent.monitor.FALLBACK_MONITOR_LOG", fallback_log)
+    monkeypatch.setattr("mac_audit_agent.monitor.STDOUT_MONITOR_LOG", stdout_log)
+    monkeypatch.setattr("mac_audit_agent.monitor.STDERR_MONITOR_LOG", stderr_log)
+    service = BackgroundMonitorService(tmp_path / "audit.sqlite", mode="user-notifier", record_startup=False)
+    monkeypatch.setattr(service.notifications, "notify", lambda event, force=False: (True, ""))
+
+    assert service._run_integrity_detector() == []
+    fallback_log.unlink()
+    service._last_integrity_poll = 0
+    events = service._run_integrity_detector()
+
+    assert [event.event_type for event in events] == ["protected_monitor_tamper_detected"]
+    assert "deleted or destroyed" in events[0].evidence
+    assert fallback_log.exists()

@@ -58,6 +58,7 @@ class ExecutionEvidenceEngine:
         active_connections = [self._as_dict(item) for item in self._as_list(ports.get("active_connections", []))]
         files = [self._as_dict(item) for item in self._as_list(artifacts.get("file_issues", []))]
         launch_items = [self._as_dict(item) for item in self._as_list(artifacts.get("launch_snapshots", []))]
+        intrusion_methods = artifacts.get("intrusion_methods", {}) if isinstance(artifacts.get("intrusion_methods", {}), dict) else {}
         login_items = self._login_items(artifacts, scan_result.baseline_diff or {})
         baseline = scan_result.baseline_diff or {}
 
@@ -78,10 +79,54 @@ class ExecutionEvidenceEngine:
             if finding is not None:
                 findings.append(finding)
 
+        findings.extend(self._intrusion_method_findings(scan_result, intrusion_methods))
+
         if not findings:
             return []
 
         findings.sort(key=lambda item: (-self._confidence_rank(item.confidence), item.related_process.lower(), item.related_path.lower(), item.title.lower()))
+        return findings
+
+    def _intrusion_method_findings(self, scan_result: ScanResult, intrusion_methods: dict[str, Any]) -> list[ExecutionEvidenceFinding]:
+        findings: list[ExecutionEvidenceFinding] = []
+        for item in self._as_list(intrusion_methods.get("memory", [])):
+            payload = self._as_dict(item)
+            evidence = str(payload.get("evidence", ""))
+            process_name = str(payload.get("process_name", ""))
+            process_path = str(payload.get("process_path", ""))
+            finding = ExecutionEvidenceFinding(
+                title=str(payload.get("title", "Possible in-memory code execution")),
+                confidence=str(payload.get("confidence", "medium")),
+                evidence_items=[evidence],
+                timeline=[{"timestamp": scan_result.timestamp, "source": "memory", "description": evidence}],
+                explanation="Memory-map metadata showed executable anonymous, heap, stack, or writable memory. This can be legitimate for JIT/runtime software, but it is also a useful shellcode or reflective-loading review signal.",
+                next_steps=[
+                    "Preserve vmmap output and a process listing before termination.",
+                    "Review parent process, code signature, file hash, and active network connections.",
+                ],
+                indicator_types=["memory", "execution"],
+                related_process=process_name,
+                related_path=process_path,
+            )
+            findings.append(finding)
+        for item in self._as_list(intrusion_methods.get("persistence", [])):
+            payload = self._as_dict(item)
+            evidence = str(payload.get("evidence", ""))
+            finding = ExecutionEvidenceFinding(
+                title=str(payload.get("title", "ATT&CK persistence method observed")),
+                confidence=str(payload.get("confidence", "medium")),
+                evidence_items=[evidence],
+                timeline=[{"timestamp": scan_result.timestamp, "source": "persistence", "description": evidence}],
+                explanation="A known macOS persistence surface or high-risk persistence configuration was observed. Persistence alone is not proof of intrusion, but it should be correlated with execution, account, and network activity.",
+                next_steps=[
+                    "Preserve the plist or script and verify ownership, signature, and referenced executable path.",
+                    "Correlate with recent process execution, network connections, and baseline drift.",
+                ],
+                indicator_types=["persistence"],
+                related_process=str(payload.get("method", "")),
+                related_path=str(payload.get("path", "")),
+            )
+            findings.append(finding)
         return findings
 
     def _process_finding(

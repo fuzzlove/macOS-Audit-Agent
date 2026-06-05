@@ -5,12 +5,13 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from mac_audit_agent.ui.main_window import MainWindow
+from mac_audit_agent.ui.main_window import MainWindow, create_security_tray_icon
 from mac_audit_agent.ui.startup_notice import preview_startup_notice
 
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setWindowIcon(create_security_tray_icon())
     if not preview_startup_notice():
         return 0
     db_path = Path.home() / ".mac_audit_agent.sqlite3"

@@ -41,6 +41,7 @@ def run_command(command: list[str]) -> tuple[int, str, str]:
 class HardwareMonitorSnapshot:
     usb_devices: list[dict[str, str]] = field(default_factory=list)
     bluetooth_devices: list[dict[str, str]] = field(default_factory=list)
+    nearby_bluetooth_devices: list[dict[str, str]] = field(default_factory=list)
     moisture_markers: set[str] = field(default_factory=set)
     moisture_capability: str = "explicit-marker monitoring unavailable"
 
@@ -51,7 +52,7 @@ class HardwareMonitor:
 
     def collect_snapshot(self) -> HardwareMonitorSnapshot:
         usb_devices = self.collect_usb_devices()
-        bluetooth_devices = self.collect_bluetooth_devices()
+        bluetooth_devices, nearby_bluetooth_devices = self.collect_bluetooth_inventory()
         hpm_code, hpm_stdout, _ = self.executor(["/usr/sbin/ioreg", "-r", "-c", "AppleHPMDevice", "-l", "-w", "0"])
         log_code, log_stdout, _ = self.executor(
             [
@@ -75,6 +76,7 @@ class HardwareMonitor:
         return HardwareMonitorSnapshot(
             usb_devices=usb_devices,
             bluetooth_devices=bluetooth_devices,
+            nearby_bluetooth_devices=nearby_bluetooth_devices,
             moisture_markers=moisture_markers,
             moisture_capability=capability,
         )
@@ -86,8 +88,31 @@ class HardwareMonitor:
         return self._parse_usb_devices(stdout) if code == 0 else []
 
     def collect_bluetooth_devices(self) -> list[dict[str, str]]:
+        connected, _nearby = self.collect_bluetooth_inventory()
+        return connected
+
+    def collect_bluetooth_inventory(self) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         code, stdout, _ = self.executor(["/usr/sbin/ioreg", "-r", "-c", "IOBluetoothDevice", "-l", "-w", "0"])
-        return self._parse_bluetooth_devices(stdout) if code == 0 else []
+        devices = self._parse_bluetooth_devices(stdout) if code == 0 else []
+        nearby_devices: list[dict[str, str]] = []
+        profiler_code, profiler_stdout, _ = self.executor(["/usr/sbin/system_profiler", "SPBluetoothDataType", "-json"])
+        if profiler_code == 0:
+            connected, nearby = self._parse_system_profiler_bluetooth_inventory(profiler_stdout)
+            devices.extend(connected)
+            nearby_devices.extend(nearby)
+        by_key: dict[str, dict[str, str]] = {}
+        for device in devices:
+            key = self._bluetooth_key(device)
+            if key:
+                by_key[key] = {**by_key.get(key, {}), **device}
+        connected_devices = sorted(by_key.values(), key=self._bluetooth_key)
+        connected_keys = {self._bluetooth_key(item) for item in connected_devices}
+        nearby_by_key: dict[str, dict[str, str]] = {}
+        for device in nearby_devices:
+            key = self._bluetooth_key(device)
+            if key and key not in connected_keys:
+                nearby_by_key[key] = {**nearby_by_key.get(key, {}), **device}
+        return connected_devices, sorted(nearby_by_key.values(), key=self._bluetooth_key)
 
     def evaluate(
         self,
@@ -102,6 +127,7 @@ class HardwareMonitor:
             events.extend(self.usb_connection_events(previous.usb_devices, current.usb_devices, timestamp=timestamp))
         if previous is not None:
             events.extend(self.bluetooth_connection_events(previous.bluetooth_devices, current.bluetooth_devices, timestamp=timestamp))
+            events.extend(self.nearby_bluetooth_events(previous.nearby_bluetooth_devices, current.nearby_bluetooth_devices, timestamp=timestamp))
         previous_markers = previous.moisture_markers if previous else set()
         for marker in sorted(current.moisture_markers - previous_markers):
             events.append(
@@ -119,6 +145,58 @@ class HardwareMonitor:
                     current_state=marker,
                 )
             )
+        return events
+
+    def nearby_bluetooth_events(
+        self,
+        previous_devices: list[dict[str, str]],
+        current_devices: list[dict[str, str]],
+        *,
+        timestamp: str | None = None,
+    ) -> list[BackgroundMonitorEvent]:
+        timestamp = timestamp or utc_now_iso()
+        previous_keys = {self._bluetooth_key(item) for item in previous_devices}
+        current_keys = {self._bluetooth_key(item) for item in current_devices}
+        events: list[BackgroundMonitorEvent] = []
+        for item in current_devices:
+            key = self._bluetooth_key(item)
+            if not key or key in previous_keys:
+                continue
+            events.append(
+                self._event(
+                    timestamp=timestamp,
+                    event_type="nearby_bluetooth_device_detected",
+                    severity="medium",
+                    source="system_profiler_bluetooth_observer",
+                    evidence=f"New nearby or remembered Bluetooth device observed: {self._bluetooth_label(item)}.",
+                    confidence="medium",
+                    recommendation="Confirm whether this nearby Bluetooth identity is expected in the environment. This is a review signal, not proof of compromise.",
+                    metadata=item,
+                    identity=key,
+                    rule=rule_for_event("nearby_bluetooth_device_detected"),
+                    previous_state="device not previously observed nearby",
+                    current_state=self._bluetooth_label(item),
+                )
+            )
+        if previous_keys != current_keys:
+            added = sorted(current_keys - previous_keys)
+            removed = sorted(previous_keys - current_keys)
+            if added or removed:
+                events.append(
+                    self._event(
+                        timestamp=timestamp,
+                        event_type="nearby_bluetooth_inventory_changed",
+                        severity="medium",
+                        source="system_profiler_bluetooth_observer",
+                        evidence=f"Nearby Bluetooth inventory changed; added={len(added)} removed={len(removed)}.",
+                        confidence="medium",
+                        recommendation="Review nearby Bluetooth identities and correlate with room/device activity.",
+                        metadata={"added": added, "removed": removed},
+                        rule=rule_for_event("nearby_bluetooth_inventory_changed"),
+                        previous_state=f"nearby count={len(previous_devices)}",
+                        current_state=f"nearby count={len(current_devices)}",
+                    )
+                )
         return events
 
     def bluetooth_connection_events(
@@ -303,6 +381,9 @@ class HardwareMonitor:
                 for prop in PROPERTY_RE.finditer(block)
             }
             connected = str(properties.get("Connected", "")).strip().lower()
+            connected = connected or str(properties.get("DeviceIsConnected", "")).strip().lower()
+            connected = connected or str(properties.get("deviceIsConnected", "")).strip().lower()
+            connected = connected or str(properties.get("IsConnected", "")).strip().lower()
             if connected not in {"yes", "true", "1"}:
                 continue
             devices.append(
@@ -314,6 +395,53 @@ class HardwareMonitor:
                 }
             )
         return devices
+
+    def _parse_system_profiler_bluetooth_devices(self, output: str) -> list[dict[str, str]]:
+        connected, _nearby = self._parse_system_profiler_bluetooth_inventory(output)
+        return connected
+
+    def _parse_system_profiler_bluetooth_inventory(self, output: str) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return [], []
+        connected_devices: list[dict[str, str]] = []
+        nearby_devices: list[dict[str, str]] = []
+
+        def visit(value) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"device_connected", "device_not_connected", "device_paired"} and isinstance(child, list):
+                        for item in child:
+                            if not isinstance(item, dict):
+                                continue
+                            device = self._system_profiler_bluetooth_device(item, source_bucket=key)
+                            if not device:
+                                continue
+                            if key == "device_connected":
+                                connected_devices.append(device)
+                            else:
+                                nearby_devices.append(device)
+                    visit(child)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(payload)
+        return connected_devices, nearby_devices
+
+    def _system_profiler_bluetooth_device(self, item: dict, *, source_bucket: str) -> dict[str, str]:
+        name = str(item.get("_name") or item.get("device_name") or item.get("name") or "").strip()
+        address = str(item.get("device_address") or item.get("address") or item.get("DeviceAddress") or "").strip()
+        if not (name or address):
+            return {}
+        return {
+            "name": name or "unknown Bluetooth device",
+            "address": address,
+            "vendor_id": str(item.get("device_vendorID") or item.get("vendor_id") or ""),
+            "product_id": str(item.get("device_productID") or item.get("product_id") or ""),
+            "source_bucket": source_bucket,
+        }
 
     def _usb_key(self, item: dict[str, str]) -> str:
         return "|".join(str(item.get(key, "")) for key in ["vendor_id", "product_id", "serial", "location_id", "session_id"])

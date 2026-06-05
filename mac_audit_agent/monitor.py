@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ import re
 import subprocess
 import time
 import signal
+import stat
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -99,6 +101,8 @@ DEDUPE_SECONDS = 60
 NETWORK_POLL_SECONDS = 2.0
 PERSISTENCE_POLL_SECONDS = 10.0
 INTEGRITY_POLL_SECONDS = 60.0
+LOG_INTEGRITY_MANIFEST_STATE_KEY = "monitor_log_integrity_manifest_json"
+LOG_INTEGRITY_CHAIN_STATE_KEY = "monitor_log_integrity_chain_head"
 PS_LINE_RE = re.compile(r"^\s*(\d+)\s+(.*?)\s{2,}(.*)$")
 
 
@@ -184,6 +188,54 @@ def clear_monitor_log_files() -> list[Path]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
     return paths
+
+
+def _canonical_json_digest(payload: object) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_for_file_prefix(path: Path, byte_count: int | None = None) -> str:
+    digest = hashlib.sha256()
+    remaining = byte_count
+    with path.open("rb") as handle:
+        while True:
+            if remaining is not None and remaining <= 0:
+                break
+            read_size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining)
+            chunk = handle.read(read_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _log_file_integrity_state(path: Path) -> dict[str, object]:
+    expanded = path.expanduser()
+    if not expanded.exists():
+        return {
+            "path": str(expanded),
+            "exists": False,
+            "size": 0,
+            "sha256": "",
+            "mode": "",
+            "owner_uid": None,
+            "group_gid": None,
+            "world_writable": False,
+        }
+    stat_result = expanded.stat()
+    return {
+        "path": str(expanded),
+        "exists": True,
+        "size": int(stat_result.st_size),
+        "sha256": _sha256_for_file_prefix(expanded),
+        "mode": oct(stat.S_IMODE(stat_result.st_mode)),
+        "owner_uid": int(stat_result.st_uid),
+        "group_gid": int(stat_result.st_gid),
+        "world_writable": bool(stat_result.st_mode & stat.S_IWOTH),
+    }
 
 
 def tail_text_file(path: Path, lines: int = 30) -> str:
@@ -1451,6 +1503,8 @@ class BackgroundMonitorService:
                     "network_gateway": current.gateway,
                     "network_subnet": current.subnet,
                     "network_scope": current.scope,
+                    "network_active_interfaces": current.active_interfaces,
+                    "network_dns_servers": current.dns_servers,
                     "vpn_interfaces": current.vpn_interfaces,
                 }
             )
@@ -1470,6 +1524,8 @@ class BackgroundMonitorService:
                 "network_gateway": current.gateway,
                 "network_subnet": current.subnet,
                 "network_scope": current.scope,
+                "network_active_interfaces": current.active_interfaces,
+                "network_dns_servers": current.dns_servers,
                 "vpn_interfaces": current.vpn_interfaces,
             }
         )
@@ -1589,43 +1645,162 @@ class BackgroundMonitorService:
         return recorded
 
     def _run_integrity_detector(self) -> list[BackgroundMonitorEvent]:
-        if not self.system_daemon_mode:
-            return []
         now = time.monotonic()
         if self._last_integrity_poll and now - self._last_integrity_poll < INTEGRITY_POLL_SECONDS:
             return []
         self._last_integrity_poll = now
-        integrity = verify_protected_monitor_integrity(scope="system")
-        fingerprint = evidence_hash(integrity)
+        events: list[BackgroundMonitorEvent] = []
+        integrity = verify_protected_monitor_integrity(scope="system") if self.system_daemon_mode else {"tamper_detected": False}
+        log_integrity = self._evaluate_monitor_log_integrity()
+        combined_integrity = {
+            **integrity,
+            "log_integrity": log_integrity,
+            "tamper_detected": bool(integrity.get("tamper_detected")) or bool(log_integrity.get("tamper_detected")),
+            "severity": "critical" if log_integrity.get("tamper_detected") else str(integrity.get("severity", "high")),
+            "confidence": "high" if log_integrity.get("tamper_detected") else str(integrity.get("confidence", "high")),
+            "evidence": [*list(integrity.get("evidence", []) or []), *list(log_integrity.get("evidence", []) or [])],
+        }
+        fingerprint = evidence_hash(combined_integrity)
         previous_fingerprint = self.db.get_background_monitor_state("monitor_protection_integrity_fingerprint", "")
-        self.db.set_background_monitor_state("monitor_protection_integrity_json", json.dumps(integrity, sort_keys=True))
+        self.db.set_background_monitor_state("monitor_protection_integrity_json", json.dumps(combined_integrity, sort_keys=True))
         self.db.set_background_monitor_state("monitor_protection_integrity_fingerprint", fingerprint)
-        self.latest_snapshot["monitor_protection_integrity"] = integrity
+        self.latest_snapshot["monitor_protection_integrity"] = combined_integrity
         self._store_current_snapshot()
-        if not integrity.get("tamper_detected") or fingerprint == previous_fingerprint:
-            return []
-        evidence_items = [str(item) for item in integrity.get("evidence", [])]
+        if not combined_integrity.get("tamper_detected") or fingerprint == previous_fingerprint:
+            return events
+        evidence_items = [str(item) for item in combined_integrity.get("evidence", [])]
         event = self._build_event(
             "protected_monitor_tamper_detected",
-            "; ".join(evidence_items) or "Protected monitor integrity changed from the installed manifest.",
-            severity=str(integrity.get("severity", "high")),
-            confidence=str(integrity.get("confidence", "high")),
+            "; ".join(evidence_items) or "Protected monitor or log integrity changed from the installed manifest.",
+            severity=str(combined_integrity.get("severity", "critical")),
+            confidence=str(combined_integrity.get("confidence", "high")),
             source="integrity_check",
             process_name="com.mac-audit-agent.monitor",
-            trigger_subsource="protected_runtime_manifest",
+            trigger_subsource="protected_runtime_and_log_integrity",
             previous_state="installed manifest expectation",
-            current_state="protected monitor integrity drift observed",
-            related_path=str(integrity.get("plist_path", "")),
+            current_state="protected monitor or log integrity drift observed",
+            related_path=str(log_integrity.get("primary_tamper_path") or combined_integrity.get("plist_path", "")),
             related_user="root",
         )
-        event.metadata_json = json.dumps(integrity, sort_keys=True)
+        event.metadata_json = json.dumps(combined_integrity, sort_keys=True)
         event.recommendation = str(
-            integrity.get(
+            combined_integrity.get(
                 "recommendation",
-                "Review recent administrative activity and reinstall the protected monitor from a trusted source if the change was not approved.",
+                "Review recent administrative activity, preserve evidence, and reinstall the protected monitor from a trusted source if the change was not approved.",
             )
         )
-        return [event] if self.record_monitor_event(event, notify_force=True) else []
+        if self.record_monitor_event(event, notify_force=True):
+            events.append(event)
+        return events
+
+    def _monitor_log_integrity_paths(self) -> list[Path]:
+        return [FALLBACK_MONITOR_LOG.expanduser(), STDOUT_MONITOR_LOG.expanduser(), STDERR_MONITOR_LOG.expanduser()]
+
+    def _record_monitor_log_integrity_manifest(self, *, previous_chain: str = "", reason: str = "baseline") -> dict[str, object]:
+        files = [_log_file_integrity_state(path) for path in self._monitor_log_integrity_paths()]
+        manifest_body = {
+            "schema": "mac-audit-agent-log-integrity-v1",
+            "algorithm": "sha256-chain-prefix",
+            "recorded_at": utc_now_iso(),
+            "reason": reason,
+            "files": files,
+            "previous_chain_head": previous_chain,
+        }
+        chain_head = _canonical_json_digest({"previous": previous_chain, "manifest": manifest_body})
+        manifest = {**manifest_body, "chain_head": chain_head}
+        self.db.set_background_monitor_state(LOG_INTEGRITY_MANIFEST_STATE_KEY, json.dumps(manifest, sort_keys=True))
+        self.db.set_background_monitor_state(LOG_INTEGRITY_CHAIN_STATE_KEY, chain_head)
+        self.db.set_background_monitor_state("monitor_log_integrity_status", "tracked")
+        return manifest
+
+    def _evaluate_monitor_log_integrity(self) -> dict[str, object]:
+        previous_raw = self.db.get_background_monitor_state(LOG_INTEGRITY_MANIFEST_STATE_KEY, "")
+        previous_chain = self.db.get_background_monitor_state(LOG_INTEGRITY_CHAIN_STATE_KEY, "")
+        if not previous_raw:
+            manifest = self._record_monitor_log_integrity_manifest(previous_chain=previous_chain, reason="initial_baseline")
+            return {
+                "tamper_detected": False,
+                "status": "baseline_created",
+                "algorithm": manifest["algorithm"],
+                "chain_head": manifest["chain_head"],
+                "evidence": [],
+            }
+        try:
+            previous_manifest = json.loads(previous_raw)
+        except json.JSONDecodeError:
+            manifest = self._record_monitor_log_integrity_manifest(previous_chain=previous_chain, reason="manifest_recovered_after_corruption")
+            return {
+                "tamper_detected": True,
+                "status": "manifest_corrupt",
+                "algorithm": manifest["algorithm"],
+                "chain_head": manifest["chain_head"],
+                "primary_tamper_path": str(default_monitor_db_path("system" if self.system_daemon_mode else "user")),
+                "evidence": ["monitor log integrity manifest in SQLite was corrupt or unreadable"],
+            }
+
+        evidence: list[str] = []
+        primary_tamper_path = ""
+        previous_by_path = {str(item.get("path", "")): item for item in previous_manifest.get("files", []) if isinstance(item, dict)}
+        current_files = [_log_file_integrity_state(path) for path in self._monitor_log_integrity_paths()]
+        for current in current_files:
+            path = str(current.get("path", ""))
+            previous = previous_by_path.get(path)
+            if previous is None:
+                continue
+            if bool(current.get("world_writable")):
+                evidence.append(f"log file is world writable: {path}")
+                primary_tamper_path = primary_tamper_path or path
+            if bool(previous.get("exists")) and not bool(current.get("exists")):
+                evidence.append(f"log file was deleted or destroyed: {path}")
+                primary_tamper_path = primary_tamper_path or path
+                continue
+            if not bool(previous.get("exists")) and bool(current.get("exists")):
+                continue
+            if not bool(current.get("exists")):
+                continue
+            if previous.get("mode") and current.get("mode") != previous.get("mode"):
+                evidence.append(f"log file mode changed: {path} {previous.get('mode')} -> {current.get('mode')}")
+                primary_tamper_path = primary_tamper_path or path
+            if previous.get("owner_uid") is not None and current.get("owner_uid") != previous.get("owner_uid"):
+                evidence.append(f"log file owner changed: {path} uid {previous.get('owner_uid')} -> {current.get('owner_uid')}")
+                primary_tamper_path = primary_tamper_path or path
+            previous_size = int(previous.get("size", 0) or 0)
+            current_size = int(current.get("size", 0) or 0)
+            previous_sha = str(previous.get("sha256", "") or "")
+            current_sha = str(current.get("sha256", "") or "")
+            if current_size < previous_size:
+                evidence.append(f"log file was truncated: {path} {previous_size} -> {current_size} bytes")
+                primary_tamper_path = primary_tamper_path or path
+            elif current_size == previous_size and previous_sha and current_sha != previous_sha:
+                evidence.append(f"log file content changed in place: {path}")
+                primary_tamper_path = primary_tamper_path or path
+            elif current_size > previous_size and previous_sha:
+                try:
+                    prefix_sha = _sha256_for_file_prefix(Path(path), previous_size)
+                except OSError:
+                    prefix_sha = ""
+                if prefix_sha != previous_sha:
+                    evidence.append(f"log file earlier bytes changed before append: {path}")
+                    primary_tamper_path = primary_tamper_path or path
+        for path in self._monitor_log_integrity_paths():
+            try:
+                ensure_monitor_log_file(path)
+            except OSError:
+                pass
+        reason = "tamper_rebaseline" if evidence else "append_only_update"
+        manifest = self._record_monitor_log_integrity_manifest(previous_chain=previous_chain, reason=reason)
+        status = "tamper_detected" if evidence else "verified_append_only"
+        self.db.set_background_monitor_state("monitor_log_integrity_status", status)
+        return {
+            "tamper_detected": bool(evidence),
+            "status": status,
+            "algorithm": manifest["algorithm"],
+            "chain_head": manifest["chain_head"],
+            "previous_chain_head": previous_chain,
+            "primary_tamper_path": primary_tamper_path,
+            "evidence": evidence,
+            "files": manifest["files"],
+        }
 
     def _coalesce_usb_observer_events(self, events: list[BackgroundMonitorEvent]) -> list[BackgroundMonitorEvent]:
         if not events:

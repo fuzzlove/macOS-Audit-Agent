@@ -160,6 +160,28 @@ RULES: dict[str, Rule] = {
         ["network reconnect", "interface reassignment", "expected VPN or dock change"],
         ["Confirm the new connection matches expected network activity.", "Review nearby session, device, and login events."],
     ),
+    "network_interface_connected": _rule(
+        "network_interface_connected",
+        "Network Interface Connected",
+        "network",
+        "A non-loopback network interface became active and received an IP address.",
+        "medium",
+        "high",
+        "network_detector",
+        ["dock attached", "Wi-Fi reconnected", "Ethernet cable connected", "VPN or tethering interface appeared"],
+        ["Confirm the interface is expected for this environment.", "Review nearby session, device, and VPN events."],
+    ),
+    "network_interface_disconnected": _rule(
+        "network_interface_disconnected",
+        "Network Interface Disconnected",
+        "network",
+        "A previously active non-loopback network interface disappeared or lost its IP assignment.",
+        "medium",
+        "high",
+        "network_detector",
+        ["dock detached", "Wi-Fi roamed", "Ethernet cable removed", "VPN or tethering interface ended"],
+        ["Confirm the interface disconnect was expected.", "Review nearby session and device events."],
+    ),
     "new_outbound_connection_detected": _rule(
         "new_outbound_connection_detected",
         "New Outbound Connection Detected",
@@ -702,6 +724,30 @@ RULES: dict[str, Rule] = {
         ["Review the evidence summary, parent process, and launch context.", "Preserve logs and review the timeline."],
         "T1059",
     ),
+    "mitre_persistence_method_detected": _rule(
+        "mitre_persistence_method_detected",
+        "MITRE Persistence Method Detected",
+        "persistence",
+        "A known macOS persistence method or high-risk persistence configuration was observed.",
+        "high",
+        "medium",
+        "intrusion_methods",
+        ["managed endpoint agent", "VPN client", "software updater", "developer automation"],
+        ["Preserve the plist or script.", "Verify ownership, signature, referenced executable path, and recent execution/network context."],
+        "T1543/T1037/T1053",
+    ),
+    "possible_shellcode_memory_detected": _rule(
+        "possible_shellcode_memory_detected",
+        "Possible Shellcode Memory Detected",
+        "execution",
+        "A process memory map contains executable anonymous, heap, stack, or writable memory characteristics that require review.",
+        "critical",
+        "medium",
+        "intrusion_methods",
+        ["browser or runtime JIT", "emulator", "security tool", "debugger", "language runtime"],
+        ["Preserve vmmap output and process context before termination.", "Review parent process, code signature, hash, and network connections."],
+        "T1055/T1620",
+    ),
     "unsigned_process_from_temp": _rule(
         "unsigned_process_from_temp",
         "Unsigned Process From Temp",
@@ -945,6 +991,10 @@ def canonical_event_type(event_type: str) -> str:
 
 def rule_for_finding(category: str, title: str, evidence: str = "", command_used: str = "") -> Rule:
     normalized = f"{category} {title} {evidence} {command_used}".lower()
+    if "shellcode" in normalized or "in-memory code" in normalized or "vmmap" in normalized:
+        return RULES["possible_shellcode_memory_detected"]
+    if "att&ck persistence" in normalized or "mitre persistence" in normalized:
+        return RULES["mitre_persistence_method_detected"]
     if "launchdaemon" in normalized:
         return RULES["launchdaemon_added"]
     if "launchagent" in normalized:

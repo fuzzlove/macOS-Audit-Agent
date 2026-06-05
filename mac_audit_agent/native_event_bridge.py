@@ -116,6 +116,8 @@ def native_event_supported_types() -> set[str]:
         "launchagent_added",
         "launchdaemon_added",
         "login_item_added",
+        "mitre_persistence_method_detected",
+        "possible_shellcode_memory_detected",
     }
 
 

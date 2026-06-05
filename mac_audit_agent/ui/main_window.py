@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import subprocess
 import shlex
 from datetime import datetime
 from pathlib import Path
 import sys
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QBrush, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QBrush, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QProgressBar,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSizePolicy,
     QListWidgetItem,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -79,8 +82,10 @@ from mac_audit_agent.runner import RunnerConfig, SafeCommandRunner
 from mac_audit_agent.storage import AuditDatabase, json_safe
 from mac_audit_agent.cve_radar import CveRadarEngine
 from mac_audit_agent.execution_evidence import ExecutionEvidenceEngine
+from mac_audit_agent.family_safety import FamilySafetyAuditor, export_family_safety_html, export_family_safety_json
 from mac_audit_agent.intrusion_correlation import IntrusionCorrelationEngine
 from mac_audit_agent.operational_health import OperationalHealthEngine
+from mac_audit_agent.ui.family_safety_panel import FamilySafetyPanel
 from mac_audit_agent.ui.investigation_priority_panel import InvestigationPriorityPanel
 from mac_audit_agent.ui.context_dialog import ContextDialog
 from mac_audit_agent.ui.provenance_dialog import AlertProvenanceDialog
@@ -106,6 +111,34 @@ USAGE_GUIDE_TITLE = f"How to Use {APP_TITLE}"
 RISK_COLORS = {"safe": "#238b45", "sensitive": "#d4a017", "dangerous": "#c0392b"}
 SEVERITY_PRIORITY = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 REVIEW_STATES = ["not reviewed", "reviewed", "needs follow-up", "false positive", "confirmed concern"]
+STARTUP_STRATEGY_QUOTES = [
+    {"source": "Sun Tzu", "text": "The supreme art of war is to subdue the enemy without fighting."},
+    {"source": "Sun Tzu", "text": "In the midst of chaos, there is also opportunity."},
+    {"source": "Sun Tzu", "text": "If you know the enemy and know yourself, you need not fear the result of a hundred battles."},
+    {"source": "Sun Tzu", "text": "Victorious warriors win first and then go to war."},
+    {"source": "Sun Tzu", "text": "All warfare is based on deception."},
+    {"source": "Sun Tzu", "text": "Appear weak when you are strong, and strong when you are weak."},
+    {"source": "Sun Tzu", "text": "He will win who knows when to fight and when not to fight."},
+    {"source": "Strategy Note", "text": "Power is easier to keep when your intentions are disciplined and your signals are deliberate."},
+    {"source": "Strategy Note", "text": "Control the tempo: make evidence, timing, and context work before you act."},
+    {"source": "Strategy Note", "text": "Never let attention outrun preparation; visibility without leverage is noise."},
+    {"source": "Strategy Note", "text": "Influence starts with attention, but trust is won by restraint and precision."},
+    {"source": "Strategy Note", "text": "Create space for others to reveal intent before you reveal your own conclusion."},
+    {"source": "Strategy Note", "text": "Mastery comes from patient repetition, clear feedback, and ruthless correction of weak habits."},
+    {"source": "Strategy Note", "text": "Study the system until anomalies stand out without drama."},
+    {"source": "Strategy Note", "text": "Skill compounds when every investigation leaves better notes, cleaner tools, and sharper judgment."},
+]
+
+
+def format_startup_strategy_quote(entry: dict[str, str]) -> str:
+    return f"{entry['source']}: {entry['text']}"
+
+
+def choose_startup_strategy_quote(previous_quote: str = "", rng: random.Random | None = None) -> str:
+    chooser = rng or random.SystemRandom()
+    formatted = [format_startup_strategy_quote(entry) for entry in STARTUP_STRATEGY_QUOTES]
+    candidates = [quote for quote in formatted if quote != previous_quote]
+    return chooser.choice(candidates or formatted)
 
 
 class ClickableLabel(QLabel):
@@ -540,11 +573,52 @@ def normalize_findings(findings):
     return [normalize_finding(finding) for finding in (findings or [])]
 
 
+def create_security_tray_icon(size: int = 64) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    shield = QPainterPath()
+    shield.moveTo(size * 0.50, size * 0.08)
+    shield.lineTo(size * 0.82, size * 0.20)
+    shield.cubicTo(size * 0.80, size * 0.58, size * 0.69, size * 0.79, size * 0.50, size * 0.92)
+    shield.cubicTo(size * 0.31, size * 0.79, size * 0.20, size * 0.58, size * 0.18, size * 0.20)
+    shield.closeSubpath()
+    painter.setBrush(QBrush(QColor("#0B1220")))
+    painter.setPen(QPen(QColor("#7DD3FC"), max(2, size // 24)))
+    painter.drawPath(shield)
+
+    inner = QPainterPath()
+    inner.moveTo(size * 0.50, size * 0.18)
+    inner.lineTo(size * 0.72, size * 0.27)
+    inner.cubicTo(size * 0.69, size * 0.55, size * 0.62, size * 0.70, size * 0.50, size * 0.80)
+    inner.cubicTo(size * 0.38, size * 0.70, size * 0.31, size * 0.55, size * 0.28, size * 0.27)
+    inner.closeSubpath()
+    painter.setBrush(QBrush(QColor("#0EA5E9")))
+    painter.setPen(Qt.NoPen)
+    painter.drawPath(inner)
+
+    lock_body = QRectF(size * 0.35, size * 0.46, size * 0.30, size * 0.22)
+    painter.setBrush(QBrush(QColor("#F8FAFC")))
+    painter.drawRoundedRect(lock_body, size * 0.04, size * 0.04)
+    painter.setPen(QPen(QColor("#F8FAFC"), max(3, size // 16)))
+    painter.drawArc(QRectF(size * 0.38, size * 0.31, size * 0.24, size * 0.27), 0, 180 * 16)
+    painter.setPen(QPen(QColor("#0B1220"), max(2, size // 26)))
+    painter.drawLine(QPointF(size * 0.50, size * 0.54), QPointF(size * 0.50, size * 0.61))
+    painter.end()
+
+    return QIcon(pixmap)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db_path: Path, config: AuditConfig | None = None) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.resize(1440, 900)
+        self.security_icon = create_security_tray_icon()
+        self.setWindowIcon(self.security_icon)
 
         self.db_path = db_path
         self.config = config or AuditConfig()
@@ -552,6 +626,7 @@ class MainWindow(QMainWindow):
         self.runner = SafeCommandRunner(RunnerConfig(dry_run=self.config.dry_run))
         self.collectors = CollectorSuite(self.runner, self.config)
         self.db = AuditDatabase(db_path, self.config.logs_dir, self.config.log_retention_days)
+        self.startup_quote = self._select_startup_quote()
         self.notification_manager = NotificationManager(self.db)
         self.cve_radar_engine = CveRadarEngine(self.db, self.config)
         self.recovery_center = SystemRecoveryCenter(self.db, self.config)
@@ -559,12 +634,14 @@ class MainWindow(QMainWindow):
         self.intrusion_correlation_engine = IntrusionCorrelationEngine(self.db, self.workflow_layer)
         self.execution_evidence_engine = ExecutionEvidenceEngine()
         self.investigation_priority_engine = InvestigationPriorityEngine(self.db, self.workflow_layer)
+        self.family_safety_auditor = FamilySafetyAuditor()
         self.launch_agent_manager = LaunchAgentManager(db_path)
         self.vulnerability_reviewer = AggressiveLocalVulnerabilityReviewer(self.config)
         self.current_scan_summary: ScanSummary | None = None
         self.current_payload: dict | None = None
         self.current_visible_findings: list[dict] = []
         self.current_selected_finding: dict | None = None
+        self.family_safety_report = None
         self.execution_evidence_findings: list[dict] = []
         self.operational_health_engine = OperationalHealthEngine(
             self.db,
@@ -575,6 +652,11 @@ class MainWindow(QMainWindow):
             cve_radar_engine=self.cve_radar_engine,
         )
         self._active_network_discovery_dialog: NetworkDiscoveryProgressDialog | None = None
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_status_action: QAction | None = None
+        self.tray_events_action: QAction | None = None
+        self.tray_status_timer: QTimer | None = None
+        self._force_quit_from_tray = False
         self.findings_sort_order = "critical_to_low"
         self.last_ui_debug: dict[str, object] = {}
         try:
@@ -586,6 +668,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menus()
+        self._setup_tray_icon()
         self._load_registry()
         self._refresh_command_preview_page()
         self._refresh_dashboard()
@@ -604,6 +687,12 @@ class MainWindow(QMainWindow):
         self.refresh_apple_security_forecast(manual=False, initial_load=True)
         self.refresh_system_recovery(manual=False, initial_load=True)
 
+    def _select_startup_quote(self) -> str:
+        previous_quote = self.db.get_background_monitor_state("startup_strategy_quote", "")
+        quote = choose_startup_strategy_quote(previous_quote)
+        self.db.set_background_monitor_state("startup_strategy_quote", quote)
+        return quote
+
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
@@ -614,6 +703,7 @@ class MainWindow(QMainWindow):
         self.sidebar = QListWidget()
         self.sidebar.addItems([
             "Dashboard",
+            "Family & Safety",
             "Intrusion Detection",
             "Investigation Priorities",
             "Flight Recorder",
@@ -641,6 +731,10 @@ class MainWindow(QMainWindow):
         self.cve_radar_panel.review_requested.connect(self._review_cve_radar_card)
         self.cve_radar_panel.snooze_requested.connect(self._snooze_cve_radar_card)
         self.cve_radar_panel.set_status("Forecast not checked yet")
+        self.family_safety_panel = FamilySafetyPanel(self)
+        self.family_safety_panel.audit_requested.connect(self.run_family_safety_audit)
+        self.family_safety_panel.export_html_requested.connect(self.export_family_safety_html)
+        self.family_safety_panel.export_json_requested.connect(self.export_family_safety_json)
         self.intrusion_detection_panel = IntrusionDetectionPanel()
         self.intrusion_detection_panel.refresh_requested.connect(self.refresh_intrusion_detection)
         self.intrusion_detection_panel.show_context_requested.connect(self._show_intrusion_context)
@@ -673,6 +767,7 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_dashboard_page(), resizable=True))
+        self.pages.addWidget(self._wrap_in_scroll_area(self._build_family_safety_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_intrusion_detection_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_investigation_priorities_page(), resizable=True))
         self.pages.addWidget(self._wrap_in_scroll_area(self._build_flight_recorder_page(), resizable=True))
@@ -695,7 +790,12 @@ class MainWindow(QMainWindow):
         self.main_splitter.addWidget(self.details_panel)
         self.main_splitter.setSizes([1000, 360])
 
-        outer.addWidget(self.sidebar)
+        left_column = QVBoxLayout()
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(8)
+        left_column.addWidget(self.sidebar, 1)
+        left_column.addWidget(self._build_left_demo_ad_card())
+        outer.addLayout(left_column)
         outer.addWidget(self.main_splitter)
         self._update_responsive_layout()
         self.cve_radar_timer = QTimer(self)
@@ -709,6 +809,95 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(widget)
         return scroll
+
+    def _build_left_demo_ad_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("leftDemoAdCard")
+        card.setProperty("themeCard", True)
+        card.setCursor(Qt.PointingHandCursor)
+        card.setToolTip("Open Patreon support page")
+        card.setMaximumWidth(240)
+        card.setMaximumHeight(116)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        card.setStyleSheet(
+            """
+            QFrame#leftDemoAdCard {
+                background: rgba(34, 197, 94, 28);
+                border: 1px solid rgba(134, 239, 172, 120);
+                border-radius: 8px;
+            }
+            QFrame#leftDemoAdCard QLabel {
+                background: transparent;
+            }
+            """
+        )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        badge_row = QHBoxLayout()
+        badge_row.setContentsMargins(0, 0, 0, 0)
+        badge_row.setSpacing(6)
+        label = QLabel("KEEP IT FREE")
+        label.setStyleSheet("font-size: 11px; font-weight: 700; color: #86EFAC;")
+        badge_row.addWidget(label)
+        badge_row.addWidget(self._build_verified_badge(16))
+        badge_row.addStretch(1)
+        title = QLabel("Support the author")
+        title.setStyleSheet("font-size: 14px; font-weight: 700; color: #F0F6FC;")
+        body = QLabel("Optional support helps this free tool keep improving.")
+        body.setWordWrap(True)
+        body.setStyleSheet("color: #D6E4FF;")
+        layout.addLayout(badge_row)
+        layout.addWidget(title)
+        layout.addWidget(body)
+        card.mousePressEvent = lambda event: self.open_support_author_link() if event.button() == Qt.LeftButton else None
+        return card
+
+    def _build_verified_badge(self, size: int) -> QLabel:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(QBrush(QColor("#1D9BF0")))
+        painter.setPen(Qt.NoPen)
+        points = [
+            QPointF(size * 0.50, size * 0.02),
+            QPointF(size * 0.62, size * 0.15),
+            QPointF(size * 0.80, size * 0.10),
+            QPointF(size * 0.85, size * 0.28),
+            QPointF(size * 0.98, size * 0.40),
+            QPointF(size * 0.88, size * 0.56),
+            QPointF(size * 0.94, size * 0.75),
+            QPointF(size * 0.75, size * 0.80),
+            QPointF(size * 0.62, size * 0.98),
+            QPointF(size * 0.50, size * 0.85),
+            QPointF(size * 0.38, size * 0.98),
+            QPointF(size * 0.25, size * 0.80),
+            QPointF(size * 0.06, size * 0.75),
+            QPointF(size * 0.12, size * 0.56),
+            QPointF(size * 0.02, size * 0.40),
+            QPointF(size * 0.15, size * 0.28),
+            QPointF(size * 0.20, size * 0.10),
+            QPointF(size * 0.38, size * 0.15),
+        ]
+        badge = QPainterPath()
+        badge.moveTo(points[0])
+        for point in points[1:]:
+            badge.lineTo(point)
+        badge.closeSubpath()
+        painter.drawPath(badge)
+        painter.setPen(QPen(QColor("#FFFFFF"), max(2, size // 8), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(QPointF(size * 0.30, size * 0.52), QPointF(size * 0.44, size * 0.66))
+        painter.drawLine(QPointF(size * 0.44, size * 0.66), QPointF(size * 0.72, size * 0.34))
+        painter.end()
+        label = QLabel()
+        label.setFixedSize(size, size)
+        label.setPixmap(pixmap)
+        label.setToolTip("Verified support link")
+        return label
+
+    def open_support_author_link(self) -> None:
+        QDesktopServices.openUrl(QUrl("https://www.patreon.com/16166750/join"))
 
     def _build_menus(self) -> None:
         diagnostics_menu = self.menuBar().addMenu("Diagnostics")
@@ -745,6 +934,9 @@ class MainWindow(QMainWindow):
         test_idle_warning_action.triggered.connect(self.trigger_background_monitor_test_idle_warning)
         background_monitor_menu.addAction(test_idle_warning_action)
         settings_menu = self.menuBar().addMenu("Settings")
+        family_safety_action = QAction("Family & Safety", self)
+        family_safety_action.triggered.connect(self.show_family_safety_page)
+        settings_menu.addAction(family_safety_action)
         appearance_action = QAction("Appearance", self)
         appearance_action.triggered.connect(self.show_skins_page)
         settings_menu.addAction(appearance_action)
@@ -762,6 +954,116 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self.show_about_dialog)
         help_menu.addAction(about_action)
 
+    def _setup_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            LOGGER.info("System tray is not available; tray monitor icon disabled.")
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+
+        self.tray_icon = QSystemTrayIcon(self.security_icon, self)
+        self.tray_icon.setToolTip(APP_TITLE)
+        self.tray_icon.activated.connect(self._handle_tray_activation)
+
+        tray_menu = QMenu(self)
+        open_action = QAction("Open Security Viewer", self)
+        open_action.triggered.connect(self.restore_from_tray)
+        tray_menu.addAction(open_action)
+
+        settings_action = QAction("Background Monitor", self)
+        settings_action.triggered.connect(self.open_background_monitor_from_tray)
+        tray_menu.addAction(settings_action)
+
+        logs_action = QAction("View Security Logs", self)
+        logs_action.triggered.connect(self.open_logs_from_tray)
+        tray_menu.addAction(logs_action)
+
+        tray_menu.addSeparator()
+        self.tray_status_action = QAction("Monitor status: checking", self)
+        self.tray_status_action.setEnabled(False)
+        tray_menu.addAction(self.tray_status_action)
+        self.tray_events_action = QAction("Recent events: checking", self)
+        self.tray_events_action.setEnabled(False)
+        tray_menu.addAction(self.tray_events_action)
+
+        refresh_action = QAction("Refresh Status", self)
+        refresh_action.triggered.connect(self._refresh_tray_status)
+        tray_menu.addAction(refresh_action)
+
+        tray_menu.addSeparator()
+        quit_action = QAction("Quit Viewer", self)
+        quit_action.triggered.connect(self.quit_from_tray)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+
+        self.tray_status_timer = QTimer(self)
+        self.tray_status_timer.setInterval(30_000)
+        self.tray_status_timer.timeout.connect(self._refresh_tray_status)
+        self.tray_status_timer.start()
+        self._refresh_tray_status()
+
+    def _tray_monitor_summary(self) -> tuple[str, str]:
+        status = self.db.get_background_monitor_status()
+        if status.running:
+            state = "running"
+        elif status.loaded:
+            state = "loaded"
+        elif status.installed:
+            state = "installed, not running"
+        else:
+            state = "not installed"
+        heartbeat = status.last_heartbeat or "no heartbeat recorded"
+        details = [
+            APP_TITLE,
+            f"Background monitor: {state}",
+            f"Last heartbeat: {heartbeat}",
+            f"Events in last 10 min: {status.events_last_10_minutes}",
+        ]
+        if status.last_error:
+            details.append("Last error recorded")
+        return state, "\n".join(details)
+
+    def _refresh_tray_status(self) -> None:
+        if self.tray_icon is None:
+            return
+        state, tooltip = self._tray_monitor_summary()
+        status = self.db.get_background_monitor_status()
+        self.tray_icon.setToolTip(tooltip)
+        if self.tray_status_action is not None:
+            self.tray_status_action.setText(f"Monitor status: {state}")
+        if self.tray_events_action is not None:
+            self.tray_events_action.setText(f"Recent events: {status.events_last_10_minutes} in 10 min")
+
+    def _handle_tray_activation(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
+            self.restore_from_tray()
+
+    def restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._refresh_tray_status()
+
+    def open_background_monitor_from_tray(self) -> None:
+        self.restore_from_tray()
+        self.show_background_monitor_page()
+
+    def open_logs_from_tray(self) -> None:
+        self.restore_from_tray()
+        self.show_logs_page()
+
+    def quit_from_tray(self) -> None:
+        self._force_quit_from_tray = True
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(True)
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+        self.close()
+
     def _build_dashboard_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -778,6 +1080,10 @@ class MainWindow(QMainWindow):
         self.score_label.setWordWrap(True)
         self.summary_label = QLabel("No scans yet.")
         self.summary_label.setWordWrap(True)
+        self.startup_quote_label = QLabel(self.startup_quote)
+        self.startup_quote_label.setWordWrap(True)
+        self.startup_quote_label.setToolTip("Random strategy quote selected on application startup.")
+        self.startup_quote_label.setStyleSheet("font-size: 15px; font-weight: 600;")
         self.header_logo_label = QLabel()
         self.header_logo_label.setFixedSize(64, 64)
         self.header_logo_label.setAlignment(Qt.AlignCenter)
@@ -957,6 +1263,7 @@ class MainWindow(QMainWindow):
             self.severity_card_widgets.append(card)
 
         layout.addWidget(header)
+        layout.addWidget(self.startup_quote_label)
         layout.addWidget(self.dashboard_logo_label, alignment=Qt.AlignHCenter)
         layout.addWidget(privacy)
         layout.addWidget(cards_frame)
@@ -980,6 +1287,13 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(self.intrusion_detection_panel)
+        return page
+
+    def _build_family_safety_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.family_safety_panel)
         return page
 
     def _build_investigation_priorities_page(self) -> QWidget:
@@ -1283,8 +1597,98 @@ class MainWindow(QMainWindow):
         ):
             review_actions.addWidget(widget, index // 2, index % 2)
         layout.addLayout(review_actions)
+        layout.addStretch(1)
+        layout.addWidget(self._build_demo_test_ad_card())
         self._clear_selected_finding_panel()
         return panel
+
+    def _build_demo_test_ad_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("demoTestAdCard")
+        card.setProperty("themeCard", True)
+        card.setCursor(Qt.PointingHandCursor)
+        card.setToolTip("Open Patreon support page")
+        card.setMaximumHeight(142)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        card.setStyleSheet(
+            """
+            QFrame#demoTestAdCard {
+                background: rgba(14, 165, 233, 32);
+                border: 1px solid rgba(125, 211, 252, 130);
+                border-radius: 8px;
+            }
+            QFrame#demoTestAdCard QLabel {
+                background: transparent;
+            }
+            """
+        )
+        outer = QHBoxLayout(card)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(10)
+        qr_label = self._build_demo_qr_label(104)
+        if qr_label is not None:
+            outer.addWidget(qr_label)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        label = QLabel("SUPPORT THE AUTHOR")
+        label.setStyleSheet("font-size: 11px; font-weight: 700; color: #7DD3FC;")
+        message = QLabel("Mac Audit Agent is free")
+        message.setStyleSheet("font-size: 15px; font-weight: 700; color: #F0F6FC;")
+        body = QLabel("If this helped you, a small thank-you supports future work.")
+        body.setWordWrap(True)
+        body.setStyleSheet("color: #D6E4FF;")
+        layout.addWidget(label)
+        layout.addWidget(message)
+        layout.addWidget(body)
+        layout.addStretch(1)
+        outer.addLayout(layout, 1)
+        card.mousePressEvent = lambda event: self.open_support_author_link() if event.button() == Qt.LeftButton else None
+        return card
+
+    def _build_demo_qr_label(self, size: int) -> QLabel | None:
+        for name in ["demo_qr.png", "ad_qr.png", "qr.png", "demo_qr.jpg", "ad_qr.jpg", "qr.jpg"]:
+            for path in [get_asset_path(name), Path.cwd() / name]:
+                if not path.exists():
+                    continue
+                pixmap = QPixmap(str(path))
+                if pixmap.isNull():
+                    continue
+                label = QLabel()
+                label.setFixedSize(size, size)
+                label.setAlignment(Qt.AlignCenter)
+                label.setToolTip("Demo QR code")
+                quiet_zone = max(8, size // 10)
+                qr_size = max(1, size - (quiet_zone * 2))
+                padded = QPixmap(size, size)
+                padded.fill(QColor("#FFFFFF"))
+                painter = QPainter(padded)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                painter.drawPixmap(
+                    quiet_zone,
+                    quiet_zone,
+                    pixmap.scaled(qr_size, qr_size, Qt.KeepAspectRatio, Qt.FastTransformation),
+                )
+                painter.end()
+                label.setPixmap(padded)
+                label.setStyleSheet("background: #FFFFFF; border: 1px solid rgba(255, 255, 255, 150); border-radius: 6px;")
+                return label
+        label = QLabel("QR\nCODE")
+        label.setFixedSize(size, size)
+        label.setAlignment(Qt.AlignCenter)
+        label.setToolTip("Place demo_qr.png in mac_audit_agent/assets or the repo root.")
+        label.setStyleSheet(
+            """
+            background: #FFFFFF;
+            color: #0B1220;
+            border: 1px dashed rgba(11, 18, 32, 150);
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 4px;
+            """
+        )
+        return label
 
     def _make_table(self, headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -2412,6 +2816,37 @@ class MainWindow(QMainWindow):
             self.theme_panel.set_theme(theme.name, accessibility)
         self.statusBar().showMessage(f"Theme applied: {theme.name}", 3000)
 
+    def run_family_safety_audit(self, profile: str = "Shared Family Computer") -> None:
+        try:
+            self.family_safety_report = self.family_safety_auditor.build_report(profile)
+        except Exception as exc:
+            LOGGER.exception("Failed to run Family Safety audit: %s", exc)
+            QMessageBox.warning(self, "Family Safety Audit Failed", str(exc))
+            return
+        self.family_safety_panel.set_report(self.family_safety_report.to_dict())
+        self.statusBar().showMessage("Family Safety audit completed locally", 4000)
+
+    def _current_family_safety_report(self):
+        report = getattr(self, "family_safety_report", None)
+        if report is None:
+            self.run_family_safety_audit(self.family_safety_panel.profile_combo.currentText())
+            report = getattr(self, "family_safety_report", None)
+        return report
+
+    def export_family_safety_html(self) -> None:
+        report = self._current_family_safety_report()
+        if report is None:
+            return
+        path = export_family_safety_html(report)
+        QMessageBox.information(self, "Family Safety Report Exported", f"Local HTML report saved to:\n{path}")
+
+    def export_family_safety_json(self) -> None:
+        report = self._current_family_safety_report()
+        if report is None:
+            return
+        path = export_family_safety_json(report)
+        QMessageBox.information(self, "Family Safety Report Exported", f"Local JSON report saved to:\n{path}")
+
     def export_intrusion_ai_summary(self) -> None:
         try:
             report = self.intrusion_correlation_engine.build_report(scan_result=self.current_scan_result)
@@ -2764,42 +3199,46 @@ class MainWindow(QMainWindow):
     def _change_page(self, row: int) -> None:
         if row >= 0 and hasattr(self, "pages"):
             self.pages.setCurrentIndex(row)
-            if row == 2 and hasattr(self, "results_tabs"):
+            current_item = self.sidebar.item(row) if hasattr(self, "sidebar") else None
+            current_text = current_item.text() if current_item is not None else ""
+            if current_text == "Investigation Priorities" and hasattr(self, "results_tabs"):
                 self.results_tabs.setCurrentWidget(self.investigation_priority_panel)
-            elif row == 10 and hasattr(self, "results_tabs"):
+            elif current_text == "Results" and hasattr(self, "results_tabs"):
                 self.results_tabs.setCurrentIndex(0)
 
+    def _show_sidebar_page(self, title: str) -> None:
+        if not hasattr(self, "sidebar"):
+            return
+        matches = self.sidebar.findItems(title, Qt.MatchExactly)
+        if matches:
+            self.sidebar.setCurrentItem(matches[0])
+
     def show_forecast_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(5)
+        self._show_sidebar_page("Apple Security Forecast")
 
     def show_intrusion_detection_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(1)
+        self._show_sidebar_page("Intrusion Detection")
 
     def show_investigation_priorities_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(2)
+        self._show_sidebar_page("Investigation Priorities")
 
     def show_flight_recorder_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(3)
+        self._show_sidebar_page("Flight Recorder")
 
     def show_system_recovery_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(4)
+        self._show_sidebar_page("Evidence Snapshots")
 
     def show_logs_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(6)
+        self._show_sidebar_page("Logs")
 
     def show_settings_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(7)
+        self._show_sidebar_page("Settings")
 
     def show_skins_page(self) -> None:
-        if hasattr(self, "sidebar"):
-            self.sidebar.setCurrentRow(8)
+        self._show_sidebar_page("Skins")
+
+    def show_family_safety_page(self) -> None:
+        self._show_sidebar_page("Family & Safety")
 
     def show_background_monitor_page(self) -> None:
         self.show_settings_page()
@@ -3142,10 +3581,25 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        if self.tray_icon is not None and self.tray_icon.isVisible() and not self._force_quit_from_tray:
+            event.ignore()
+            self.hide()
+            self._refresh_tray_status()
+            self.tray_icon.showMessage(
+                "Mac Audit Agent",
+                "Security viewer is still available from the tray icon.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+            return
         dialog = getattr(self, "_active_network_discovery_dialog", None)
         if dialog is not None:
             dialog.cancel_scan()
             dialog._stop_worker()
+        if self.tray_status_timer is not None:
+            self.tray_status_timer.stop()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         super().closeEvent(event)
 
     def run_packet_capture_snapshot(self) -> None:

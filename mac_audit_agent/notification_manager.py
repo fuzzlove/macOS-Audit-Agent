@@ -41,6 +41,8 @@ IMPORTANT_EVENT_TYPES = {
     "input_activity_idle_started",
     "remote_login_enabled",
     "suspicious_process_observed",
+    "mitre_persistence_method_detected",
+    "possible_shellcode_memory_detected",
     "persistence_item_created",
     "localhost_hidden_port_detected",
     "new_admin_user_detected",
@@ -102,6 +104,8 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "bluetooth_inventory_changed",
     "unknown_hid_device_detected",
     "new_network_connection_detected",
+    "network_interface_connected",
+    "network_interface_disconnected",
     "new_outbound_connection_detected",
     "new_inbound_connection_detected",
     "new_ip_assigned",
@@ -121,6 +125,8 @@ MANDATORY_VISIBLE_ALERT_EVENT_TYPES = {
     "login_item_added",
     "persistence_item_created_high_risk",
     "protected_monitor_tamper_detected",
+    "mitre_persistence_method_detected",
+    "possible_shellcode_memory_detected",
     "unexpected_process_execution",
     "execution_evidence_detected",
     "suspicious_process_observed",
@@ -162,6 +168,8 @@ MANDATORY_CRITICAL_EVENT_TYPES = {
     "login_item_added",
     "persistence_item_created_high_risk",
     "protected_monitor_tamper_detected",
+    "mitre_persistence_method_detected",
+    "possible_shellcode_memory_detected",
     "unexpected_process_execution",
     "execution_evidence_detected",
     "suspicious_process_observed",
@@ -264,9 +272,13 @@ DEFAULT_EVENT_PREFERENCES: dict[str, dict[str, object]] = {
     "new_usb_device_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 0, "notification_mode": "both"},
     "system_moisture_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "both"},
     "protected_monitor_tamper_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
+    "mitre_persistence_method_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
+    "possible_shellcode_memory_detected": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 300, "notification_mode": "dialog"},
     "monitor_self_impact_warning": {"enabled": True, "severity": "critical", "notify": True, "cooldown_seconds": 900, "notification_mode": "dialog"},
-    "network_ip_assigned": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
-    "vpn_connected": {"enabled": True, "severity": "info", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "network_ip_assigned": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "network_interface_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "network_interface_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
+    "vpn_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 0, "notification_mode": "notification"},
     "bluetooth_device_connected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "notification"},
     "bluetooth_device_disconnected": {"enabled": True, "severity": "medium", "notify": True, "cooldown_seconds": 60, "notification_mode": "notification"},
     "unknown_hid_device_detected": {"enabled": True, "severity": "high", "notify": True, "cooldown_seconds": 60, "notification_mode": "dialog"},
@@ -327,6 +339,8 @@ VISIBLE_ALERT_CATEGORY_EVENT_TYPES = {
     },
     "network": {
         "new_network_connection_detected",
+        "network_interface_connected",
+        "network_interface_disconnected",
         "network_ip_assigned",
         "new_ip_assigned",
         "new_outbound_connection_detected",
@@ -345,6 +359,8 @@ VISIBLE_ALERT_CATEGORY_EVENT_TYPES = {
         "launchdaemon_removed",
         "login_item_added",
         "persistence_item_created_high_risk",
+        "mitre_persistence_method_detected",
+        "possible_shellcode_memory_detected",
         "protected_monitor_tamper_detected",
         "screen_sharing_enabled",
         "remote_login_enabled",
@@ -894,7 +910,7 @@ class NotificationManager:
                     pass
             return AlertDecision(True, style, f"{category} mandatory visible alert", cooldown, event.severity == "critical")
 
-        if event.severity in {"high", "critical"}:
+        if event.severity in {"medium", "high", "critical"}:
             style = self._style_for_visible_alert(event, category=category)
             cooldown = int(settings.get("cooldown_seconds_per_category", 600) or 600)
             last_timestamp = self.db.get_background_monitor_state(self._visible_alert_last_key(event), "")
@@ -905,7 +921,7 @@ class NotificationManager:
                         return AlertDecision(False, style, "within_cooldown", remaining, event.severity == "critical")
                 except ValueError:
                     pass
-            return AlertDecision(True, style, f"{category} high-priority alert", cooldown, event.severity == "critical")
+            return AlertDecision(True, style, f"{category} severity alert", cooldown, event.severity == "critical")
 
         if event_type in VISIBLE_ALERT_CATEGORY_EVENT_TYPES["advisory"]:
             style = self._style_for_visible_alert(event, category=category)
@@ -1245,7 +1261,10 @@ class NotificationManager:
         popup_allowed, reason = self.should_popup(event, settings)
         decision["popup_allowed"] = popup_allowed
         event.popup_allowed = popup_allowed
-        notify_candidate = bool(visible_alert.show and self._is_mandatory_visible_event(event)) or (
+        explicit_disabled = explicit_preference and (
+            not preference.get("notify", False) or str(preference.get("notification_mode", "none")) == "none"
+        )
+        notify_candidate = bool(visible_alert.show and not explicit_disabled) or (
             popup_allowed and bool(preference.get("notify", False) or explicit_preference or event.event_type in CRITICAL_POPUP_ALLOWLIST)
         )
         if not notify_candidate:

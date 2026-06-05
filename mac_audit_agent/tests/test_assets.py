@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from mac_audit_agent.assets import get_asset_path
-from mac_audit_agent.ui.main_window import MainWindow
+from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, format_startup_strategy_quote
 
 
 def test_asset_path_resolves_logo() -> None:
@@ -60,6 +60,44 @@ def test_main_window_title_includes_liquidsky_brand(tmp_path: Path) -> None:
     assert window.windowTitle() == "macOS Security Audit Agent - Liquidsky Network Security"
     window.close()
     app.processEvents()
+
+
+def test_startup_strategy_quote_picker_excludes_previous_quote() -> None:
+    previous = format_startup_strategy_quote(STARTUP_STRATEGY_QUOTES[0])
+
+    class FakeRandom:
+        def choice(self, values):
+            assert previous not in values
+            return values[0]
+
+    assert choose_startup_strategy_quote(previous, rng=FakeRandom()) != previous
+
+
+def test_main_window_shows_new_strategy_quote_each_open(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    db_path = tmp_path / "audit.sqlite"
+    formatted_quotes = {format_startup_strategy_quote(entry) for entry in STARTUP_STRATEGY_QUOTES}
+    first_window = MainWindow(db_path)
+    first_quote = first_window.startup_quote
+    assert first_window.startup_quote_label.text() == first_quote
+    assert first_quote in formatted_quotes
+    first_window.close()
+
+    second_window = MainWindow(db_path)
+    second_quote = second_window.startup_quote
+    assert second_window.startup_quote_label.text() == second_quote
+    assert second_quote in formatted_quotes
+    assert second_quote != first_quote
+    second_window.close()
+    app.processEvents()
+
+
+def test_startup_strategy_quotes_include_requested_theme_sources() -> None:
+    texts = [entry["text"] for entry in STARTUP_STRATEGY_QUOTES]
+    assert any(entry["source"] == "Sun Tzu" for entry in STARTUP_STRATEGY_QUOTES)
+    assert any("Power" in text or "power" in text for text in texts)
+    assert any("Influence" in text or "attention" in text for text in texts)
+    assert any("Mastery" in text or "Skill" in text or "mastery" in text for text in texts)
 
 
 def test_open_reports_folder_uses_application_support_path(tmp_path: Path, monkeypatch) -> None:

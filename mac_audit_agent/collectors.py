@@ -35,6 +35,11 @@ from mac_audit_agent.analyzers import (
 )
 from mac_audit_agent.command_registry import build_command_registry
 from mac_audit_agent.config import AuditConfig
+from mac_audit_agent.intrusion_methods import (
+    analyze_launch_item_for_persistence,
+    analyze_vmmap_output,
+    scan_persistence_methods,
+)
 from mac_audit_agent.rules import correlation_id_for, evidence_hash, normalized_signal, rule_for_finding
 from mac_audit_agent.models import (
     AuditCommand,
@@ -172,6 +177,13 @@ class CollectorSuite:
             {"launch_snapshots": []},
             lambda: {"launch_snapshots": self._collect_launch_items()},
         )
+        intrusion_methods_result = self._run_collector(
+            "intrusion_methods",
+            "ATT&CK persistence and memory heuristics",
+            {"intrusion_methods": {"persistence": [], "memory": [], "errors": []}, "command_results": []},
+            lambda: self._collect_intrusion_methods_result(processes_result.artifacts["processes"]["all"], launch_items_result.artifacts["launch_snapshots"]),
+        )
+        command_results.extend(intrusion_methods_result.artifacts.get("command_results", []))
         files_result = self._run_collector(
             "files",
             "targeted filesystem walk",
@@ -241,6 +253,7 @@ class CollectorSuite:
         findings.extend(self._findings_for_permissions(permission_snapshots))
         findings.extend(self._findings_for_processes(process_snapshots))
         findings.extend(self._findings_for_launch_items(launch_snapshots))
+        findings.extend(self._findings_for_intrusion_methods(intrusion_methods_result.artifacts["intrusion_methods"]))
         findings.extend(self._findings_for_files(file_issues))
         findings.extend(self._findings_for_security_commands(command_results))
         findings.extend(self._findings_for_network_info(network_info))
@@ -298,6 +311,7 @@ class CollectorSuite:
             "file_issues": file_issues,
             "processes": processes,
             "launch_snapshots": launch_snapshots,
+            "intrusion_methods": intrusion_methods_result.artifacts["intrusion_methods"],
             "launch_items": sorted(launch_items),
             "command_results": command_results,
             "network_info": network_info,
@@ -981,6 +995,68 @@ class CollectorSuite:
     def _collect_processes_result(self, command_results: list) -> CollectorResult:
         return self._collect_processes(command_results)
 
+    def _collect_intrusion_methods_result(self, process_snapshots: list[ProcessSnapshot], launch_snapshots: list[LaunchItemSnapshot]) -> CollectorResult:
+        collector_result = CollectorResult(
+            collector_name="intrusion_methods",
+            artifacts={"intrusion_methods": {"persistence": [], "memory": [], "errors": []}, "command_results": []},
+        )
+        persistence_findings = []
+        for item in launch_snapshots:
+            finding = analyze_launch_item_for_persistence(item)
+            if finding is not None:
+                persistence_findings.append(finding.to_dict())
+        for finding in scan_persistence_methods():
+            persistence_findings.append(finding.to_dict())
+
+        memory_findings = []
+        errors: list[str] = []
+        extra_results = []
+        vmmap_path = Path("/usr/bin/vmmap")
+        if vmmap_path.exists():
+            candidates = [
+                item
+                for item in process_snapshots
+                if item.pid is not None and (item.trust_level != "trusted" or any(reason in {"unsigned_process_binary", "process_in_writable_path", "process_in_user_space"} for reason in item.reasons))
+            ][:8]
+            for item in candidates:
+                command = self._runtime_command(
+                    f"runtime.memory.vmmap.{item.pid}",
+                    f"Process Memory Map pid {item.pid}",
+                    [str(vmmap_path), "-interleaved", str(item.pid)],
+                    "Files & Processes",
+                    timeout_seconds=8,
+                )
+                result = self.runner.execute(command)
+                extra_results.append(result)
+                stdout = get_stdout(result)
+                stderr = get_stderr(result)
+                exit_code = get_exit_code(result)
+                if exit_code not in (0, None):
+                    errors.append(f"vmmap pid={item.pid} failed: {(stderr or stdout)[:160]}")
+                    continue
+                for finding in analyze_vmmap_output(item.pid, item.process_name, item.command_path, stdout):
+                    memory_findings.append(finding.to_dict())
+        else:
+            errors.append("vmmap unavailable; memory-shellcode heuristic coverage skipped")
+
+        collector_result.artifacts["intrusion_methods"] = {
+            "persistence": persistence_findings,
+            "memory": memory_findings,
+            "errors": errors,
+        }
+        collector_result.artifacts["command_results"] = extra_results
+        collector_result.raw_logs.append(
+            RawLogEntry(
+                "intrusion_methods",
+                "ATT&CK persistence and vmmap heuristics",
+                utc_now_iso(),
+                None,
+                "; ".join(errors)[:300],
+                f"persistence={len(persistence_findings)} memory={len(memory_findings)}",
+            )
+        )
+        return collector_result
+
     def _collect_launch_items(self) -> list[LaunchItemSnapshot]:
         snapshots: list[LaunchItemSnapshot] = []
         for root in ["~/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]:
@@ -1494,6 +1570,40 @@ class CollectorSuite:
                 recommended_next_steps="Review the plist owner, creation time, referenced binary, and whether the launch item matches known installed software.",
                 what_can_go_wrong="Disabling a legitimate launch item can break login workflows, management agents, or installed software updates.",
                 command_used="local plist parsing",
+            ))
+        return findings
+
+    def _findings_for_intrusion_methods(self, intrusion_methods: dict) -> list[Finding]:
+        findings: list[Finding] = []
+        for item in intrusion_methods.get("persistence", []) if isinstance(intrusion_methods, dict) else []:
+            findings.append(self._finding(
+                category="Persistence",
+                title=str(item.get("title", "ATT&CK Persistence Review")),
+                severity=str(item.get("severity", "medium")),
+                description="Known macOS persistence method or high-risk persistence configuration was observed.",
+                evidence=str(item.get("evidence", "")),
+                evidence_summary=f"{item.get('method', 'persistence')} {item.get('path', '')} confidence={item.get('confidence', 'medium')} mitre={item.get('mitre', '')}",
+                raw_evidence_ref=f"intrusion_method:persistence:{item.get('path', '')}",
+                why_this_matters="Persistence lets an intruder regain execution after reboot or login. Writable paths, download-and-execute commands, login hooks, and launchd auto-start keys raise investigation priority.",
+                false_positive_notes="Management tools, VPN clients, endpoint agents, and developer automation can legitimately use these mechanisms.",
+                recommended_next_steps="Preserve the plist or script, verify owner and signature of the referenced executable, correlate with recent execution/network events, and confirm whether the persistence method is approved.",
+                what_can_go_wrong="Removing persistence without preserving evidence can destroy timeline context or break managed software.",
+                command_used="ATT&CK persistence heuristic scan",
+            ))
+        for item in intrusion_methods.get("memory", []) if isinstance(intrusion_methods, dict) else []:
+            findings.append(self._finding(
+                category="Execution",
+                title=str(item.get("title", "Possible In-Memory Code Execution")),
+                severity=str(item.get("severity", "high")),
+                description="A process memory map contains shellcode-like executable memory characteristics.",
+                evidence=str(item.get("evidence", "")),
+                evidence_summary=f"pid={item.get('pid', '')} process={item.get('process_name', '')} reasons={','.join(item.get('reasons', []))} mitre={item.get('mitre', '')}",
+                raw_evidence_ref=f"intrusion_method:memory:{item.get('pid', '')}",
+                why_this_matters="Executable anonymous, heap, stack, or writable memory can be consistent with injected shellcode, reflective loading, JIT engines, or other in-memory execution. This is a high-value review signal, not proof of compromise by itself.",
+                false_positive_notes="Browsers, language runtimes, emulators, security products, and JIT-enabled software may legitimately allocate executable memory.",
+                recommended_next_steps="Preserve a process listing, vmmap output, network connections, parent process, file hash, and code-signing status before terminating the process.",
+                what_can_go_wrong="Killing the process first can destroy volatile memory evidence needed for forensic review.",
+                command_used="/usr/bin/vmmap -interleaved <pid>",
             ))
         return findings
 
