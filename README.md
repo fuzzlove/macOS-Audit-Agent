@@ -1,6 +1,6 @@
 # macOS Security Audit Agent (MSAA)
 
-Mac Audit Agent is a local-first macOS audit, monitoring, and investigation platform. It is designed for analysts who need transparent evidence collection, reviewable alerts, and local-only reports without sending telemetry off the machine.
+MSAA is a local-first macOS audit, monitoring, and investigation platform. It is designed for analysts who need transparent evidence collection, reviewable alerts, and local-only reports without sending telemetry off the machine.
 
 This repository is intended to be understandable, auditable, and safe enough for public review, institutional evaluation, and responsible internal deployment.
 
