@@ -29,6 +29,7 @@ LAST_ACTION_STATE_KEY = "emergency_lockdown_last_action_json"
 LAST_TRACE_STATE_KEY = "emergency_lockdown_last_trace_json"
 LAST_FAILURE_STATE_KEY = "emergency_lockdown_last_failure"
 LOCKDOWN_SETTINGS_URL = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?LockdownMode"
+PRIVACY_SECURITY_SETTINGS_URL = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
 FAILURE_UNSUPPORTED_OS = "unsupported_os"
 FAILURE_UNSUPPORTED_API = "unsupported_api"
 FAILURE_MISSING_PERMISSION = "missing_permission"
@@ -42,8 +43,9 @@ FAILURE_CONFIGURATION_PROFILE_REQUIRED = "configuration_profile_required"
 FAILURE_MANAGED_ENVIRONMENT_REQUIRED = "managed_environment_required"
 FAILURE_INTERNAL_EXCEPTION = "internal_exception"
 FAILURE_UNKNOWN = "unknown"
-FAILURE_DRY_RUN = "dry_run"
-FAILURE_UNSUPPORTED_AUTOMATIC_ACTIVATION = "unsupported_automatic_activation"
+FAILURE_DRY_RUN = "dry_run_only"
+FAILURE_USER_ACTION_REQUIRED = "user_action_required"
+FAILURE_UNSUPPORTED_AUTOMATIC_ACTIVATION = "automatic_activation_unsupported_user_action_required"
 
 
 class LockdownResponseMode(str, Enum):
@@ -91,6 +93,7 @@ class EmergencyLockdownAction:
 @dataclass(frozen=True)
 class LockdownActivationTrace:
     timestamp: str
+    test_type: str
     trigger_event: str
     trigger_event_id: str
     confidence: str
@@ -108,6 +111,7 @@ class LockdownActivationTrace:
     activation_path: str
     requires_user_action: bool
     settings_opened: bool
+    user_visible_notice_shown: bool
     command: str
     arguments: list[str]
     return_code: int | None
@@ -314,26 +318,37 @@ def can_enable_lockdown(runner: Callable[..., Any] | None = None) -> dict[str, A
 
 def open_lockdown_settings_fallback(runner: Callable[..., Any] | None = None) -> dict[str, Any]:
     runner = runner or subprocess.run
-    command = ["/usr/bin/open", LOCKDOWN_SETTINGS_URL]
-    try:
-        completed = runner(command, capture_output=True, text=True, timeout=5, check=False)
-        return {
-            "opened": int(getattr(completed, "returncode", 1) or 0) == 0,
-            "command": command,
-            "return_code": int(getattr(completed, "returncode", 1) or 0),
-            "stdout": getattr(completed, "stdout", "") or "",
-            "stderr": getattr(completed, "stderr", "") or "",
-            "exception": "",
-        }
-    except Exception as exc:
-        return {
-            "opened": False,
-            "command": command,
-            "return_code": None,
-            "stdout": "",
-            "stderr": "",
-            "exception": str(exc),
-        }
+    attempts: list[dict[str, Any]] = []
+    last_result: dict[str, Any] | None = None
+    for url in [LOCKDOWN_SETTINGS_URL, PRIVACY_SECURITY_SETTINGS_URL]:
+        command = ["/usr/bin/open", url]
+        try:
+            completed = runner(command, capture_output=True, text=True, timeout=5, check=False)
+            result = {
+                "opened": int(getattr(completed, "returncode", 1) or 0) == 0,
+                "command": command,
+                "return_code": int(getattr(completed, "returncode", 1) or 0),
+                "stdout": getattr(completed, "stdout", "") or "",
+                "stderr": getattr(completed, "stderr", "") or "",
+                "exception": "",
+            }
+        except Exception as exc:
+            result = {
+                "opened": False,
+                "command": command,
+                "return_code": None,
+                "stdout": "",
+                "stderr": "",
+                "exception": str(exc),
+            }
+        attempts.append(result)
+        last_result = result
+        if result["opened"]:
+            break
+    final = dict(last_result or {})
+    final["attempts"] = attempts
+    final["attempted_paths"] = [str(item.get("command", ["", ""])[1]) for item in attempts if item.get("command")]
+    return final
 
 
 def _failure_reason(code: str, detail: str = "") -> str:
@@ -351,13 +366,8 @@ def _classify_settings_fallback_failure(result: dict[str, Any], status_after: st
         if "not found" in detail.lower():
             return _failure_reason(FAILURE_SETTINGS_NOT_FOUND, detail)
         return _failure_reason(FAILURE_SYSTEM_REJECTED_REQUEST, detail)
-    if status_after == "unknown":
-        return _failure_reason(
-            FAILURE_ACTIVATION_UNKNOWN,
-            "Settings deep link opened but no public status API verified Lockdown Mode as enabled.",
-        )
     return _failure_reason(
-        FAILURE_USER_APPROVAL_REQUIRED,
+        FAILURE_USER_ACTION_REQUIRED,
         "Settings deep link opened; macOS still requires the user to turn on Lockdown Mode, authenticate if prompted, and restart.",
     )
 
@@ -454,6 +464,7 @@ def _trace_and_action(
     *,
     policy_mode: str,
     trigger_reason: str,
+    test_type: str = "critical_event",
     configured_policy_mode: str = "",
     status_before_payload: dict[str, Any],
     status_after_payload: dict[str, Any],
@@ -483,6 +494,7 @@ def _trace_and_action(
     status_confidence = str(status_after_payload.get("confidence", "unknown"))
     trace = LockdownActivationTrace(
         timestamp=utc_now_iso(),
+        test_type=test_type,
         trigger_event=event.event_type,
         trigger_event_id=event.event_id,
         confidence=event.confidence,
@@ -500,6 +512,7 @@ def _trace_and_action(
         activation_path=activation_path,
         requires_user_action=requires_user_action,
         settings_opened=settings_opened,
+        user_visible_notice_shown=notice_shown,
         command=command,
         arguments=arguments or [],
         return_code=return_code,
@@ -550,6 +563,7 @@ def dry_run_lockdown_response(
     status_before_payload: dict[str, Any] | None = None,
     runner: Callable[..., Any] | None = None,
     notice_shown: bool = False,
+    test_type: str = "dry_run_critical_event",
 ) -> EmergencyLockdownAction:
     status_before_payload = status_before_payload or get_lockdown_status(runner)
     capability = lockdown_mode_capability(runner)
@@ -558,6 +572,7 @@ def dry_run_lockdown_response(
         event,
         policy_mode=POLICY_DRY_RUN_ONLY,
         trigger_reason=trigger_reason or "dry-run critical event",
+        test_type=test_type,
         configured_policy_mode=policy_mode,
         status_before_payload=status_before_payload,
         status_after_payload=status_before_payload,
@@ -589,6 +604,8 @@ def assist_user_lockdown_activation(
     runner: Callable[..., Any] | None = None,
     notice_shown: bool = False,
     automatic_unsupported: bool = False,
+    action_attempted: str = "assist_user",
+    test_type: str = "critical_event",
 ) -> EmergencyLockdownAction:
     snapshot_created, snapshot_path, snapshot_error = _create_emergency_snapshot(store, event, config)
     if snapshot_error:
@@ -597,6 +614,7 @@ def assist_user_lockdown_activation(
             event,
             policy_mode=policy_mode,
             trigger_reason=trigger_reason,
+            test_type=test_type,
             status_before_payload=status_before_payload,
             status_after_payload=status_before_payload,
             dry_run=False,
@@ -633,17 +651,18 @@ def assist_user_lockdown_activation(
         event,
         policy_mode=policy_mode,
         trigger_reason=trigger_reason,
+        test_type=test_type,
         status_before_payload=status_before_payload,
         status_after_payload=status_after_payload,
         dry_run=False,
-        action_attempted="assist_user",
+        action_attempted=action_attempted,
         snapshot_created=snapshot_created,
         snapshot_path=snapshot_path,
         activation_supported=False,
         automatic_activation_supported=False,
         assisted_activation_supported=True,
         activation_method="assist_user_settings_deep_link",
-        activation_path=LOCKDOWN_SETTINGS_URL,
+        activation_path=" -> ".join(str(item) for item in result.get("attempted_paths", [LOCKDOWN_SETTINGS_URL])),
         requires_user_action=not success,
         settings_opened=settings_opened,
         command=str(result["command"][0]) if result.get("command") else "",
@@ -668,6 +687,7 @@ def attempt_lockdown_activation(
     config: AuditConfig | None = None,
     runner: Callable[..., Any] | None = None,
     notice_shown: bool = False,
+    test_type: str = "critical_event",
 ) -> EmergencyLockdownAction:
     capability = lockdown_mode_capability(runner)
     if not capability.automatic_activation_supported:
@@ -681,6 +701,8 @@ def attempt_lockdown_activation(
             runner=runner,
             notice_shown=notice_shown,
             automatic_unsupported=True,
+            action_attempted="assist_user_fallback",
+            test_type=test_type,
         )
     snapshot_created, snapshot_path, snapshot_error = _create_emergency_snapshot(store, event, config)
     if snapshot_error:
@@ -689,6 +711,7 @@ def attempt_lockdown_activation(
             event,
             policy_mode=policy_mode,
             trigger_reason=trigger_reason,
+            test_type=test_type,
             status_before_payload=status_before_payload,
             status_after_payload=status_before_payload,
             dry_run=False,
@@ -713,6 +736,7 @@ def attempt_lockdown_activation(
         event,
         policy_mode=policy_mode,
         trigger_reason=trigger_reason,
+        test_type=test_type,
         status_before_payload=status_before_payload,
         status_after_payload=status_after_payload,
         dry_run=False,
@@ -740,6 +764,7 @@ def enable_lockdown_with_user_policy(
     runner: Callable[..., Any] | None = None,
     notice_callback: Callable[[str], bool] | None = None,
     dry_run: bool = False,
+    test_type: str = "critical_event",
 ) -> EmergencyLockdownAction:
     policy = load_policy(store)
     policy_mode = str(policy.get("mode", POLICY_DISABLED))
@@ -778,6 +803,7 @@ def enable_lockdown_with_user_policy(
             status_before_payload=status_before_payload,
             runner=runner,
             notice_shown=notice_shown,
+            test_type=test_type if test_type != "critical_event" else "dry_run_critical_event",
         )
     if policy_mode == POLICY_DISABLED:
         action = EmergencyLockdownAction(
@@ -828,6 +854,7 @@ def enable_lockdown_with_user_policy(
             config=config,
             runner=runner,
             notice_shown=notice_shown,
+            test_type=test_type,
         )
     if policy_mode in {POLICY_ATTEMPT_ACTIVATION, POLICY_AUTO, POLICY_AUTO_AFTER_SNAPSHOT}:
         return attempt_lockdown_activation(
@@ -839,6 +866,7 @@ def enable_lockdown_with_user_policy(
             config=config,
             runner=runner,
             notice_shown=notice_shown,
+            test_type=test_type,
         )
     return EmergencyLockdownAction(
         timestamp=utc_now_iso(),
@@ -856,3 +884,68 @@ def enable_lockdown_with_user_policy(
         dry_run=False,
         status_confidence=str(status_before_payload.get("confidence", "unknown")),
     )
+
+
+def run_lockdown_test_workflow(
+    store: StateStore,
+    *,
+    policy_mode: str,
+    test_type: str,
+    config: AuditConfig | None = None,
+    runner: Callable[..., Any] | None = None,
+    notice_callback: Callable[[str], bool] | None = None,
+) -> EmergencyLockdownAction:
+    event = BackgroundMonitorEvent(
+        event_id=f"lockdown-test-{test_type}-{utc_now_iso()}",
+        timestamp=utc_now_iso(),
+        event_type="protected_monitor_tamper_detected",
+        severity="critical",
+        source="emergency_lockdown_test_center",
+        evidence="Synthetic critical event from Test Lockdown Workflow.",
+        confidence="high",
+        simulated=True,
+    )
+    trigger_reason = "Test Lockdown Workflow synthetic critical event."
+    status_before_payload = get_lockdown_status(runner)
+    notice_shown = False
+    if notice_callback:
+        try:
+            notice_shown = bool(notice_callback(trigger_reason))
+        except Exception:
+            notice_shown = False
+    if policy_mode == POLICY_DRY_RUN_ONLY:
+        return dry_run_lockdown_response(
+            store,
+            event,
+            policy_mode=POLICY_DRY_RUN_ONLY,
+            trigger_reason=trigger_reason,
+            status_before_payload=status_before_payload,
+            runner=runner,
+            notice_shown=notice_shown,
+            test_type=test_type,
+        )
+    if policy_mode == POLICY_ASSIST_USER:
+        return assist_user_lockdown_activation(
+            store,
+            event,
+            policy_mode=POLICY_ASSIST_USER,
+            trigger_reason=trigger_reason,
+            status_before_payload=status_before_payload,
+            config=config,
+            runner=runner,
+            notice_shown=notice_shown,
+            test_type=test_type,
+        )
+    if policy_mode == POLICY_ATTEMPT_ACTIVATION:
+        return attempt_lockdown_activation(
+            store,
+            event,
+            policy_mode=POLICY_ATTEMPT_ACTIVATION,
+            trigger_reason=trigger_reason,
+            status_before_payload=status_before_payload,
+            config=config,
+            runner=runner,
+            notice_shown=notice_shown,
+            test_type=test_type,
+        )
+    raise ValueError(f"Unsupported Lockdown test policy mode: {policy_mode}")

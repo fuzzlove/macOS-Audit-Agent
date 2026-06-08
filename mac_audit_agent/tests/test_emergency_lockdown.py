@@ -10,19 +10,20 @@ from mac_audit_agent.config import AuditConfig
 from mac_audit_agent.emergency_lockdown import (
     ACTION_LOG_STATE_KEY,
     CONFIRMATION_TEXT,
-    FAILURE_ACTIVATION_UNKNOWN,
     FAILURE_DRY_RUN,
     FAILURE_SYSTEM_REJECTED_REQUEST,
     FAILURE_UNSUPPORTED_AUTOMATIC_ACTIVATION,
     LAST_ACTION_STATE_KEY,
     POLICY_DISABLED,
     POLICY_ATTEMPT_ACTIVATION,
+    POLICY_ASSIST_USER,
     POLICY_RECOMMEND_ONLY,
     TRACE_LOG_STATE_KEY,
     enable_lockdown_with_user_policy,
     get_lockdown_status,
     lockdown_mode_capability,
     load_policy,
+    run_lockdown_test_workflow,
     save_policy,
 )
 from mac_audit_agent.models import BackgroundMonitorEvent
@@ -94,7 +95,7 @@ def test_critical_event_creates_snapshot_before_action(tmp_path: Path) -> None:
     action = enable_lockdown_with_user_policy(db, _event(), config=config, runner=_runner(commands))
 
     assert action.snapshot_created is True
-    assert action.action_attempted == "assist_user"
+    assert action.action_attempted == "assist_user_fallback"
     assert action.action_success is False
     assert action.requires_user_action is True
     assert action.settings_opened is True
@@ -123,7 +124,7 @@ def test_unsupported_macos_opens_fallback_guidance(tmp_path: Path) -> None:
 
     action = enable_lockdown_with_user_policy(db, _event(), config=config, runner=_runner(commands))
 
-    assert action.action_attempted == "assist_user"
+    assert action.action_attempted == "assist_user_fallback"
     assert action.action_success is False
     assert FAILURE_UNSUPPORTED_AUTOMATIC_ACTIVATION in action.error
     assert action.activation_method == "assist_user_settings_deep_link"
@@ -142,7 +143,7 @@ def test_action_is_audited(tmp_path: Path) -> None:
     last = json.loads(db.get_background_monitor_state(LAST_ACTION_STATE_KEY, "{}"))
 
     assert last["trigger_event_id"] == action.trigger_event_id
-    assert last["action_attempted"] == "assist_user"
+    assert last["action_attempted"] == "assist_user_fallback"
 
 
 def test_lockdown_trace_records_command_and_verification_failure(tmp_path: Path) -> None:
@@ -159,7 +160,8 @@ def test_lockdown_trace_records_command_and_verification_failure(tmp_path: Path)
     assert traces[-1]["trigger_event_id"] == "event-1"
     assert traces[-1]["confidence"] == "high"
     assert traces[-1]["dry_run"] is False
-    assert traces[-1]["action_attempted"] == "assist_user"
+    assert traces[-1]["test_type"] == "critical_event"
+    assert traces[-1]["action_attempted"] == "assist_user_fallback"
     assert traces[-1]["activation_supported"] is False
     assert traces[-1]["automatic_activation_supported"] is False
     assert traces[-1]["assisted_activation_supported"] is True
@@ -229,9 +231,89 @@ def test_attempt_activation_does_not_execute_dry_run_when_unsupported(tmp_path: 
 
     assert action.policy_mode == POLICY_ATTEMPT_ACTIVATION
     assert action.dry_run is False
-    assert action.action_attempted == "assist_user"
+    assert action.action_attempted == "assist_user_fallback"
     assert action.activation_method == "assist_user_settings_deep_link"
     assert FAILURE_DRY_RUN not in action.error
+
+
+def test_assist_user_opens_settings_and_requires_user_action(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    save_policy(db, mode=POLICY_ASSIST_USER, understood=False, confirmation="")
+    commands: list[list[str]] = []
+    config = AuditConfig(logs_dir=tmp_path / "logs", cache_dir=tmp_path / "cache", recovery_snapshot_dir=tmp_path / "snapshots")
+
+    action = enable_lockdown_with_user_policy(db, _event(), config=config, runner=_runner(commands))
+    trace = json.loads(db.get_background_monitor_state(TRACE_LOG_STATE_KEY, "[]"))[-1]
+
+    assert action.policy_mode == POLICY_ASSIST_USER
+    assert action.action_attempted == "assist_user"
+    assert action.settings_opened is True
+    assert action.requires_user_action is True
+    assert action.snapshot_created is True
+    assert action.snapshot_path
+    assert action.action_success is False
+    assert "user_action_required" in action.error
+    assert trace["user_visible_notice_shown"] is False
+
+
+def test_lockdown_test_center_attempt_unsupported_falls_back_with_exact_trace(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    commands: list[list[str]] = []
+    config = AuditConfig(logs_dir=tmp_path / "logs", cache_dir=tmp_path / "cache", recovery_snapshot_dir=tmp_path / "snapshots")
+
+    action = run_lockdown_test_workflow(
+        db,
+        policy_mode=POLICY_ATTEMPT_ACTIVATION,
+        test_type="simulate_critical_event_attempt_activation",
+        config=config,
+        runner=_runner(commands),
+        notice_callback=lambda _reason: True,
+    )
+    trace = json.loads(db.get_background_monitor_state(TRACE_LOG_STATE_KEY, "[]"))[-1]
+
+    assert action.policy_mode == POLICY_ATTEMPT_ACTIVATION
+    assert action.dry_run is False
+    assert action.action_attempted == "assist_user_fallback"
+    assert action.settings_opened is True
+    assert action.requires_user_action is True
+    assert action.snapshot_created is True
+    assert action.snapshot_path
+    assert action.user_visible_notice_shown is True
+    assert action.action_success is False
+    assert "automatic_activation_unsupported_user_action_required" in action.error
+    assert trace["test_type"] == "simulate_critical_event_attempt_activation"
+    assert trace["policy_mode"] == POLICY_ATTEMPT_ACTIVATION
+    assert trace["action_attempted"] != "dry_run"
+    assert trace["automatic_activation_supported"] is False
+    assert trace["assisted_activation_supported"] is True
+    assert trace["stdout"] == ""
+    assert trace["stderr"] == ""
+    assert trace["exception"] == ""
+
+
+def test_lockdown_test_center_dry_run_records_notice_and_does_not_open_settings(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    commands: list[list[str]] = []
+
+    action = run_lockdown_test_workflow(
+        db,
+        policy_mode="dry_run_only",
+        test_type="dry_run_critical_event",
+        runner=_runner(commands),
+        notice_callback=lambda _reason: True,
+    )
+    trace = json.loads(db.get_background_monitor_state(TRACE_LOG_STATE_KEY, "[]"))[-1]
+
+    assert action.dry_run is True
+    assert action.action_attempted == "dry_run"
+    assert action.settings_opened is False
+    assert action.requires_user_action is False
+    assert action.user_visible_notice_shown is True
+    assert action.action_success is False
+    assert "dry_run_only" in action.error
+    assert trace["test_type"] == "dry_run_critical_event"
+    assert trace["settings_opened"] is False
+    assert not any(command[:1] == ["/usr/bin/open"] for command in commands)
 
 
 def test_missing_defaults_key_results_in_unknown_low_confidence_status() -> None:

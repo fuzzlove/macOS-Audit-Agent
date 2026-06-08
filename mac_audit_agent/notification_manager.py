@@ -1907,7 +1907,7 @@ class NotificationManager:
 
     def _overlay_title_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
         if event.event_type == "lockdown_mode_requires_user_action":
-            return "Lockdown Mode Requires User Action"
+            return "Emergency Lockdown Action Required"
         if event.event_type == "emergency_lockdown_failed":
             return "Emergency Lockdown Failed"
         if event.event_type in {"input_activity_resumed_after_idle", "idle_resume_detected", "mouse_or_keyboard_activity_after_idle"}:
@@ -1920,8 +1920,8 @@ class NotificationManager:
     def _overlay_details_for(self, event: BackgroundMonitorEvent, decision: AlertDecision) -> str:
         if event.event_type == "lockdown_mode_requires_user_action":
             return (
-                "A critical security event triggered Emergency Lockdown policy, but macOS requires user confirmation to enable Lockdown Mode. "
-                "The settings panel has been opened. Complete Turn On & Restart to enable Lockdown Mode."
+                "A critical security event triggered Emergency Lockdown policy. macOS requires user confirmation to enable Lockdown Mode. "
+                "The Lockdown Mode settings panel has been opened. Complete Turn On & Restart to enable Lockdown Mode."
             )
         if event.event_type == "emergency_lockdown_failed":
             return (

@@ -1440,7 +1440,7 @@ def test_lockdown_requires_user_action_overlay_opens_settings_guidance(tmp_path:
     )
     decision = manager.should_show_visible_alert(event, force=True)
 
-    assert manager._overlay_title_for(event, decision) == "Lockdown Mode Requires User Action"
+    assert manager._overlay_title_for(event, decision) == "Emergency Lockdown Action Required"
     assert "Complete Turn On & Restart" in manager._overlay_details_for(event, decision)
     assert manager._overlay_buttons_for(event) == ["Open Lockdown Settings", "View Evidence Snapshot", "Acknowledge"]
 

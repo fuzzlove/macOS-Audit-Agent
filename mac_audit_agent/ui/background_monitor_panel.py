@@ -43,6 +43,8 @@ from mac_audit_agent.emergency_lockdown import (
     enable_lockdown_with_user_policy,
     get_lockdown_status,
     load_policy,
+    open_lockdown_settings_fallback,
+    run_lockdown_test_workflow,
     save_policy,
 )
 from mac_audit_agent.launch_agent import (
@@ -526,13 +528,25 @@ class BackgroundMonitorPanel(QWidget):
         self.lockdown_confirmation_input.setPlaceholderText(CONFIRMATION_TEXT)
         emergency_layout.addWidget(self.lockdown_confirmation_input, 8, 1, 1, 2)
         self.save_lockdown_policy_button = QPushButton("Save Emergency Lockdown Policy")
-        self.lockdown_dry_run_button = QPushButton("Emergency Lockdown Dry Run")
+        test_center_title = QLabel("Test Lockdown Workflow")
+        test_center_title.setStyleSheet("font-weight: 700;")
+        self.lockdown_dry_run_button = QPushButton("Dry Run Critical Event")
+        self.lockdown_assist_test_button = QPushButton("Simulate Critical Event - Assist Mode")
+        self.lockdown_attempt_test_button = QPushButton("Simulate Critical Event - Attempt Activation")
+        self.view_lockdown_trace_button = QPushButton("View Last Lockdown Trace")
         self.copy_lockdown_diagnostics_button = QPushButton("Copy Lockdown Diagnostics")
         self.lockdown_dry_run_button.setToolTip("Dry-run only: shows what the policy would do for a critical event without changing Lockdown Mode.")
+        self.lockdown_assist_test_button.setToolTip("Creates evidence, opens Lockdown Mode settings, and shows the required user-action alert.")
+        self.lockdown_attempt_test_button.setToolTip("Attempts automatic activation only if supported; otherwise falls back to assisted activation.")
+        self.view_lockdown_trace_button.setToolTip("Show the full last LockdownActivationTrace JSON.")
         self.copy_lockdown_diagnostics_button.setToolTip("Copy the latest Lockdown activation trace and failure classification.")
         emergency_layout.addWidget(self.save_lockdown_policy_button, 8, 3)
-        emergency_layout.addWidget(self.lockdown_dry_run_button, 9, 3)
-        emergency_layout.addWidget(self.copy_lockdown_diagnostics_button, 9, 2)
+        emergency_layout.addWidget(test_center_title, 9, 0, 1, 4)
+        emergency_layout.addWidget(self.lockdown_dry_run_button, 10, 0)
+        emergency_layout.addWidget(self.lockdown_assist_test_button, 10, 1)
+        emergency_layout.addWidget(self.lockdown_attempt_test_button, 10, 2)
+        emergency_layout.addWidget(self.view_lockdown_trace_button, 10, 3)
+        emergency_layout.addWidget(self.copy_lockdown_diagnostics_button, 11, 3)
         layout.addLayout(emergency_layout)
 
         filters = QHBoxLayout()
@@ -618,6 +632,9 @@ class BackgroundMonitorPanel(QWidget):
         self.save_settings_button.clicked.connect(self.save_notification_settings)
         self.save_lockdown_policy_button.clicked.connect(self.save_emergency_lockdown_policy)
         self.lockdown_dry_run_button.clicked.connect(self.dry_run_emergency_lockdown_policy)
+        self.lockdown_assist_test_button.clicked.connect(self.simulate_lockdown_assist_mode)
+        self.lockdown_attempt_test_button.clicked.connect(self.simulate_lockdown_attempt_activation)
+        self.view_lockdown_trace_button.clicked.connect(self.view_last_lockdown_trace)
         self.copy_lockdown_diagnostics_button.clicked.connect(self.copy_lockdown_diagnostics)
         self.continuous_monitoring_checkbox.toggled.connect(self.toggle_continuous_monitoring)
         self.start_at_login_checkbox.toggled.connect(self.toggle_start_at_login)
@@ -738,6 +755,24 @@ class BackgroundMonitorPanel(QWidget):
         QApplication.clipboard().setText(json.dumps(diagnostics, indent=2, sort_keys=True))
         QMessageBox.information(self, "Lockdown Diagnostics", "Lockdown diagnostics copied to the clipboard.")
 
+    def view_last_lockdown_trace(self) -> None:
+        trace = self._latest_lockdown_trace()
+        if not trace:
+            QMessageBox.information(self, "Last Lockdown Trace", "No LockdownActivationTrace has been recorded yet.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Last Lockdown Trace")
+        layout = QVBoxLayout(dialog)
+        trace_view = QTextEdit()
+        trace_view.setReadOnly(True)
+        trace_view.setPlainText(json.dumps(trace, indent=2, sort_keys=True))
+        layout.addWidget(trace_view)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.resize(780, 560)
+        dialog.exec()
+
     def save_emergency_lockdown_policy(self) -> None:
         try:
             policy = save_policy(
@@ -755,25 +790,22 @@ class BackgroundMonitorPanel(QWidget):
         self.refresh_emergency_lockdown_policy()
 
     def dry_run_emergency_lockdown_policy(self) -> None:
-        event = BackgroundMonitorEvent(
-            event_id=f"lockdown-dry-run-{utc_now_iso()}",
-            timestamp=utc_now_iso(),
-            event_type="protected_monitor_tamper_detected",
-            severity="critical",
-            source="emergency_lockdown_dry_run",
-            evidence="Dry-run only; no system state changes.",
-            confidence="high",
-            simulated=True,
+        action = run_lockdown_test_workflow(
+            self.db,
+            policy_mode="dry_run_only",
+            test_type="dry_run_critical_event",
+            config=None,
+            notice_callback=lambda _reason: self._show_lockdown_dry_run_notice(),
         )
-        action = enable_lockdown_with_user_policy(self.db, event, dry_run=True)
         QMessageBox.information(
             self,
-            "Emergency Lockdown Dry Run",
+            "Dry Run Critical Event",
             "\n".join(
                 [
+                    "Dry run only. No Lockdown Mode setting was changed and System Settings was not opened.",
                     f"Execution mode: {action.policy_mode}",
                     f"Configured policy: {action.configured_policy_mode or action.policy_mode}",
-                    f"Would create snapshot: {'yes' if action.snapshot_created else 'no'}",
+                    f"Snapshot previewed: {'yes' if action.snapshot_created else 'no'}",
                     f"Action path: {action.action_attempted}",
                     f"Result: {'allowed' if action.action_success else 'not attempted'}",
                     f"Reason: {action.error or action.trigger_reason}",
@@ -781,6 +813,97 @@ class BackgroundMonitorPanel(QWidget):
             ),
         )
         self.refresh_emergency_lockdown_policy()
+
+    def simulate_lockdown_assist_mode(self) -> None:
+        action = run_lockdown_test_workflow(
+            self.db,
+            policy_mode=POLICY_ASSIST_USER,
+            test_type="simulate_critical_event_assist_mode",
+            config=None,
+            notice_callback=lambda _reason: True,
+        )
+        self._show_emergency_lockdown_action_required(action)
+        self._show_lockdown_action_result("Simulate Critical Event - Assist Mode", action)
+        self.refresh_emergency_lockdown_policy()
+
+    def simulate_lockdown_attempt_activation(self) -> None:
+        action = run_lockdown_test_workflow(
+            self.db,
+            policy_mode=POLICY_ATTEMPT_ACTIVATION,
+            test_type="simulate_critical_event_attempt_activation",
+            config=None,
+            notice_callback=lambda _reason: True,
+        )
+        if action.requires_user_action:
+            self._show_emergency_lockdown_action_required(action)
+        self._show_lockdown_action_result("Simulate Critical Event - Attempt Activation", action)
+        self.refresh_emergency_lockdown_policy()
+
+    def _show_lockdown_dry_run_notice(self) -> bool:
+        QMessageBox.information(
+            self,
+            "Dry Run Critical Event",
+            "Dry run only. A critical security event was simulated, but no system state was changed and Lockdown Mode settings were not opened.",
+        )
+        return True
+
+    def _show_emergency_lockdown_action_required(self, action) -> bool:
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Icon.Critical)
+        message.setWindowTitle("Emergency Lockdown Action Required")
+        message.setText("Emergency Lockdown Action Required")
+        message.setInformativeText(
+            "A critical security event triggered Emergency Lockdown policy. macOS requires user confirmation to enable Lockdown Mode. "
+            "The Lockdown Mode settings panel has been opened. Complete \"Turn On & Restart\" to enable Lockdown Mode."
+        )
+        open_button = message.addButton("Open Lockdown Settings", QMessageBox.ButtonRole.ActionRole)
+        snapshot_button = message.addButton("View Evidence Snapshot", QMessageBox.ButtonRole.ActionRole)
+        acknowledge_button = message.addButton("Acknowledge", QMessageBox.ButtonRole.AcceptRole)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked == open_button:
+            open_lockdown_settings_fallback()
+        elif clicked == snapshot_button:
+            snapshot_path = getattr(action, "snapshot_path", "") or ""
+            if snapshot_path:
+                QMessageBox.information(self, "Evidence Snapshot", f"Evidence snapshot:\n{snapshot_path}")
+            else:
+                QMessageBox.information(self, "Evidence Snapshot", "No evidence snapshot path was recorded.")
+        return clicked in {open_button, snapshot_button, acknowledge_button}
+
+    def _show_lockdown_action_result(self, title: str, action) -> None:
+        status_line = ""
+        if action.lockdown_status_after == "unknown":
+            status_line = (
+                "Lockdown Mode status could not be confirmed automatically. Verify manually in System Settings > Privacy & Security > Lockdown Mode."
+            )
+        elif action.lockdown_status_after == "enabled":
+            status_line = "Lockdown Mode is reported enabled by the current status probe."
+        else:
+            status_line = f"Lockdown Mode status after action: {action.lockdown_status_after}"
+        automatic_line = ""
+        if action.action_attempted == "assist_user_fallback":
+            automatic_line = "Lockdown Mode cannot be enabled automatically on this Mac through a verified public API. User action is required."
+        QMessageBox.information(
+            self,
+            title,
+            "\n".join(
+                item
+                for item in [
+                    automatic_line,
+                    f"Policy mode: {action.policy_mode}",
+                    f"Action attempted: {action.action_attempted}",
+                    f"Settings opened: {'true' if action.settings_opened else 'false'}",
+                    f"Requires user action: {'true' if action.requires_user_action else 'false'}",
+                    f"Snapshot created: {'true' if action.snapshot_created else 'false'}",
+                    f"Snapshot path: {action.snapshot_path or '(none)'}",
+                    f"Success: {'true' if action.action_success else 'false'}",
+                    f"Failure reason: {action.error or '(none)'}",
+                    status_line,
+                ]
+                if item
+            ),
+        )
 
     def _monitor_protection_state(self) -> dict[str, object]:
         mode = self.db.get_background_monitor_state("monitor_install_mode", "user")
