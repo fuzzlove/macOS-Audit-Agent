@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macos-security-audit-agent"
+version = "0.1.0"
+description = "Local-first macOS security audit, monitoring, and investigation agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "Mac Audit Agent contributors" }
+]
+keywords = ["macos", "security", "audit", "incident-response", "forensics"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: System Administrators",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+  "Topic :: System :: Monitoring",
+]
+dependencies = [
+  "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+]
+packaging = [
+  "build>=1.2",
+  "twine>=5.0",
+]
+pyinstaller = [
+  "pyinstaller>=6.0",
+]
+
+[project.scripts]
+macos-security-audit-agent = "mac_audit_agent.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fuzzlove/macOS-Security-Audit-Agent"
+Repository = "https://github.com/fuzzlove/macOS-Security-Audit-Agent"
+Issues = "https://github.com/fuzzlove/macOS-Security-Audit-Agent/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["mac_audit_agent*"]
+exclude = ["mac_audit_agent.tests*", "*.tests*"]
+
+[tool.setuptools.package-data]
+mac_audit_agent = [
+  "assets/*.png",
+  "assets/*.icns",
+]

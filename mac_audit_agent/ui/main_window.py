@@ -110,7 +110,7 @@ from mac_audit_agent.themes import DEFAULT_THEME_NAME, theme_for_name, theme_sty
 
 
 LOGGER = logging.getLogger(__name__)
-APP_TITLE = "macOS Security Audit Agent - Liquidsky Network Security"
+APP_TITLE = "macOS Security Audit Agent"
 SUPPORT_IMAGE_URL = "https://github.com/user-attachments/assets/e7da53a1-36b2-40fb-9856-41c0c1409ab2"
 SUPPORT_PATREON_URL = "https://www.patreon.com/16166750/join"
 ABOUT_TITLE = f"About {APP_TITLE}"
@@ -869,7 +869,7 @@ def create_security_tray_icon(size: int = 64) -> QIcon:
     return QIcon(pixmap)
 
 
-def create_demo_qr_pixmap(size: int = 112, payload: str = "Mac Audit Agent Demo") -> QPixmap:
+def create_fallback_qr_pixmap(size: int = 112, payload: str = "macOS Security Audit Agent") -> QPixmap:
     modules = 29
     module_size = max(1, size // modules)
     canvas = modules * module_size
@@ -1151,7 +1151,7 @@ class MainWindow(QMainWindow):
         self.support_ad_image_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         pixmap = load_support_image_pixmap()
         if pixmap.isNull():
-            pixmap = create_demo_qr_pixmap(100, "Mac Audit Agent Support")
+            pixmap = create_fallback_qr_pixmap(100, "macOS Security Audit Agent Support")
         self.support_ad_image_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
         text_layout = QVBoxLayout()
@@ -1193,6 +1193,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "developer_mode_action"):
             self.developer_mode_action.blockSignals(True)
             self.developer_mode_action.setChecked(enabled)
+            self.developer_mode_action.setVisible(bool(getattr(self.config, "developer_mode", False)))
             self.developer_mode_action.blockSignals(False)
         for action in getattr(self, "developer_monitor_actions", []):
             action.setVisible(enabled)
@@ -1280,6 +1281,7 @@ class MainWindow(QMainWindow):
         self.developer_mode_action.setToolTip("Show synthetic monitor test controls. Disabled by default.")
         self.developer_mode_action.toggled.connect(lambda enabled: self._set_developer_mode(enabled, persist=True))
         settings_menu.addAction(self.developer_mode_action)
+        self.developer_mode_action.setVisible(bool(getattr(self.config, "developer_mode", False)))
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About Mac Audit Agent", self)
         about_action.triggered.connect(self.show_about_dialog)

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-APP_VERSION = "background-monitor-2026.05.31"
+APP_VERSION = "0.1.0"
 RUNTIME_MANIFEST_SCHEMA_VERSION = 1
 DATABASE_SCHEMA_VERSION = 1
 

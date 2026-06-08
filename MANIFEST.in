@@ -1,0 +1,16 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include SECURITY.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include Thankyou.md
+include logo.png
+include logo2.png
+include *.spec
+recursive-include mac_audit_agent/assets *.png *.icns
+recursive-include icon.iconset *.png
+recursive-include docs *.md
+global-exclude __pycache__/*
+global-exclude *.py[cod]
+global-exclude .DS_Store

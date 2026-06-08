@@ -528,8 +528,8 @@ class BackgroundMonitorPanel(QWidget):
         self.lockdown_confirmation_input.setPlaceholderText(CONFIRMATION_TEXT)
         emergency_layout.addWidget(self.lockdown_confirmation_input, 8, 1, 1, 2)
         self.save_lockdown_policy_button = QPushButton("Save Emergency Lockdown Policy")
-        test_center_title = QLabel("Test Lockdown Workflow")
-        test_center_title.setStyleSheet("font-weight: 700;")
+        self.lockdown_test_center_title = QLabel("Test Lockdown Workflow")
+        self.lockdown_test_center_title.setStyleSheet("font-weight: 700;")
         self.lockdown_dry_run_button = QPushButton("Dry Run Critical Event")
         self.lockdown_assist_test_button = QPushButton("Simulate Critical Event - Assist Mode")
         self.lockdown_attempt_test_button = QPushButton("Simulate Critical Event - Attempt Activation")
@@ -541,7 +541,7 @@ class BackgroundMonitorPanel(QWidget):
         self.view_lockdown_trace_button.setToolTip("Show the full last LockdownActivationTrace JSON.")
         self.copy_lockdown_diagnostics_button.setToolTip("Copy the latest Lockdown activation trace and failure classification.")
         emergency_layout.addWidget(self.save_lockdown_policy_button, 8, 3)
-        emergency_layout.addWidget(test_center_title, 9, 0, 1, 4)
+        emergency_layout.addWidget(self.lockdown_test_center_title, 9, 0, 1, 4)
         emergency_layout.addWidget(self.lockdown_dry_run_button, 10, 0)
         emergency_layout.addWidget(self.lockdown_assist_test_button, 10, 1)
         emergency_layout.addWidget(self.lockdown_attempt_test_button, 10, 2)
@@ -644,7 +644,7 @@ class BackgroundMonitorPanel(QWidget):
         self.set_developer_mode(False)
         self.refresh_emergency_lockdown_policy()
 
-    def developer_only_buttons(self) -> list[QPushButton]:
+    def developer_only_buttons(self) -> list[QWidget]:
         return [
             self.test_notification_button,
             self.test_dialog_button,
@@ -654,6 +654,10 @@ class BackgroundMonitorPanel(QWidget):
             self.test_critical_alert_button,
             self.test_idle_warning_button,
             self.verify_event_flow_button,
+            self.lockdown_test_center_title,
+            self.lockdown_dry_run_button,
+            self.lockdown_assist_test_button,
+            self.lockdown_attempt_test_button,
         ]
 
     def set_developer_mode(self, enabled: bool) -> None:

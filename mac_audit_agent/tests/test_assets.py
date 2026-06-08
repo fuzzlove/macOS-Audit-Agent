@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 
 from mac_audit_agent.assets import get_asset_path
-from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, create_demo_qr_pixmap, format_startup_strategy_quote
+from mac_audit_agent.ui.main_window import MainWindow, STARTUP_STRATEGY_QUOTES, choose_startup_strategy_quote, create_fallback_qr_pixmap, format_startup_strategy_quote
 
 
 def test_asset_path_resolves_logo() -> None:
@@ -50,15 +50,15 @@ def test_usage_readme_dialog_opens_when_readme_exists(tmp_path: Path, monkeypatc
     window = MainWindow(tmp_path / "audit.sqlite")
     monkeypatch.setattr(window, "_usage_readme_path", lambda: readme_path)
     window.show_usage_readme()
-    assert exec_calls == ["How to Use macOS Security Audit Agent - Liquidsky Network Security"]
+    assert exec_calls == ["How to Use macOS Security Audit Agent"]
     window.close()
     app.processEvents()
 
 
-def test_main_window_title_includes_liquidsky_brand(tmp_path: Path) -> None:
+def test_main_window_title_uses_public_product_name(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(tmp_path / "audit.sqlite")
-    assert window.windowTitle() == "macOS Security Audit Agent - Liquidsky Network Security"
+    assert window.windowTitle() == "macOS Security Audit Agent"
     window.close()
     app.processEvents()
 
@@ -151,7 +151,7 @@ def test_support_rail_uses_image_and_patreon_link(tmp_path: Path, monkeypatch) -
 
     window.support_ad_frame.mousePressEvent(FakeEvent())
     assert opened_urls == ["https://www.patreon.com/16166750/join"]
-    assert not create_demo_qr_pixmap().isNull()
+    assert not create_fallback_qr_pixmap().isNull()
     window.close()
     app.processEvents()
 
